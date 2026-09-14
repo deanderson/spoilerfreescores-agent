@@ -13,6 +13,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
   INSIGHT_MAP, WORKER_OVERRIDES, formatDynamicLabel,
   getInsightPhrases, buildSafeView, TIER1_FIELDS,
@@ -42,6 +43,49 @@ if (start === -1 || end === -1 || end < start) {
   process.exit(2);
 }
 const block = html.slice(start, end);
+
+// ── Snapshot freshness ───────────────────────────────────────────────────────
+// The differential test is only meaningful against the CURRENT site layer. A
+// stale snapshot doesn't fail it — it makes it pass while comparing the port to
+// a frozen past. So freshness is checked before test 1 runs, and test 1 reports
+// UNVERIFIED rather than PASS when it can't be trusted.
+
+const MAX_AGE_DAYS = 14;
+let snapshotOK = true;
+
+{
+  const head = html.slice(0, 400);
+  const fetched = head.match(/^fetched: (\S+)$/m)?.[1];
+  const declaredSha = head.match(/^block-sha256: (\S+)$/m)?.[1];
+
+  if (!fetched || !declaredSha) {
+    snapshotOK = false;
+    fail('snapshot', 'no generated header — run scripts/refresh-snapshot.sh');
+  } else {
+    // The header must describe the file it sits in. A mismatch means someone
+    // edited one without the other, which is exactly what the header exists to
+    // make impossible to do silently.
+    const actualSha = createHash('sha256').update(block).digest('hex');
+    if (actualSha !== declaredSha) {
+      snapshotOK = false;
+      fail('snapshot', `header does not match file contents — hand-edited?\n`
+        + `        header: ${declaredSha}\n        actual: ${actualSha}`);
+    }
+
+    const ageDays = (Date.now() - Date.parse(fetched)) / 86_400_000;
+    if (!Number.isFinite(ageDays)) {
+      snapshotOK = false;
+      fail('snapshot', `unparseable fetched date: ${fetched}`);
+    } else if (ageDays > MAX_AGE_DAYS) {
+      snapshotOK = false;
+      fail('snapshot', `snapshot is ${ageDays.toFixed(0)} days old (limit ${MAX_AGE_DAYS}) `
+        + `— run scripts/refresh-snapshot.sh`);
+    } else if (snapshotOK) {
+      console.log(`Snapshot: ${ageDays.toFixed(1)} days old, block sha ${declaredSha.slice(0, 16)}`);
+    }
+  }
+}
+
 const site = await import(
   'data:text/javascript,' + encodeURIComponent(
     block + '\nexport {INSIGHT_MAP, formatDynamicLabel, getInsightPhrases};'
@@ -77,7 +121,11 @@ console.log('1. Differential (site vs port)');
   }
   console.log(`  ${games.length - drifted - declared} identical, `
     + `${declared} differ via declared override, ${drifted} drifted`);
-  if (drifted === 0) console.log('  PASS — no undeclared drift');
+  if (drifted === 0) {
+    console.log(snapshotOK
+      ? '  PASS — no undeclared drift'
+      : '  UNVERIFIED — no drift vs the snapshot, but the snapshot is not trustworthy');
+  }
 }
 
 // ── Test 2: invariant, over the vocabulary ───────────────────────────────────
