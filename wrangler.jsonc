@@ -37,6 +37,13 @@
 	    "database_id": "eff9b5a2-ba95-442e-a525-5b8eb377b694"
 	  }
 	],
+	"workflows": [
+	  {
+	    "name": "sfs-ingest",
+	    "binding": "INGEST",
+	    "class_name": "IngestWorkflow"
+	  }
+	],
 	"migrations": [
 		{
 			"new_sqlite_classes": [

@@ -14,6 +14,8 @@ import {
   toResult,
 } from "./guard/tools.js";
 
+export { IngestWorkflow } from "./ingest.js";
+
 const SPORT = "ncaaf";
 
 // Durable preferences (§7). Namespaced so it cannot collide with whatever
