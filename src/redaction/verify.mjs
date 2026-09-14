@@ -151,5 +151,68 @@ console.log('\n3. Tier boundary');
   if (!leaks) console.log(`  PASS — ${recommendable.length} safe views, no tier-2 field or raw label`);
 }
 
+// ── Test 4: override coverage ────────────────────────────────────────────────
+// The NCAAF fixture exercises none of the four overridden labels, so tests 1-3
+// pass whether or not the override table works. Synthetic factors close that.
+//
+// The failure this is really aimed at: a key that doesn't match anything in the
+// site map. That override silently does nothing, the differential test still
+// reports a clean diff, and the digit ships.
+
+console.log('\n4. Override coverage (synthetic)');
+{
+  const entries = Object.entries(WORKER_OVERRIDES);
+  console.log(`  ${entries.length} declared overrides`);
+
+  for (const [label, expected] of entries) {
+    const before_failures = failures;
+    const factors = [{ label, points: 10 }];
+    // Sport is irrelevant to these labels: the only sport-dependent branch in
+    // getInsightPhrases is the wnba/nba lead-change suppression, which applies
+    // to three closeness phrases, none of them overridden.
+    const sport = 'ncaaf';
+
+    // 4a. The key must be reachable in the site's map, or the override is a
+    //     no-op against a label that never existed.
+    if (!Object.prototype.hasOwnProperty.call(site.INSIGHT_MAP, label)) {
+      fail('override', `key not present in site INSIGHT_MAP — no-op override: ${JSON.stringify(label)}`);
+      continue;
+    }
+
+    // 4b. The site must actually emit something here. If it emits nothing, the
+    //     override is unnecessary and the table is carrying dead weight.
+    const before = site.getInsightPhrases(factors, sport);
+    if (before.length === 0) {
+      fail('override', `site emits nothing for ${JSON.stringify(label)} — override is dead weight`);
+      continue;
+    }
+
+    // 4c. The port must emit exactly what the table declares.
+    const after = getInsightPhrases(factors, sport);
+    const want = expected === null ? [] : [expected];
+    if (JSON.stringify(after) !== JSON.stringify(want)) {
+      fail('override', `${JSON.stringify(label)}\n        want: ${JSON.stringify(want)}\n        got:  ${JSON.stringify(after)}`);
+      continue;
+    }
+
+    // 4d. The override must have changed something. Identical output means the
+    //     row is inert.
+    if (JSON.stringify(before) === JSON.stringify(after)) {
+      fail('override', `${JSON.stringify(label)} produces identical output — inert override`);
+      continue;
+    }
+
+    // 4e. Every override exists to remove a digit. Confirm the site had one and
+    //     the port does not.
+    const siteHadDigit = before.some(p => /\d/.test(p));
+    const portHasDigit = after.some(p => /\d/.test(p));
+    if (!siteHadDigit) fail('override', `${JSON.stringify(label)}: site phrase had no digit — why is this overridden?`);
+    if (portHasDigit) fail('override', `${JSON.stringify(label)}: port phrase still contains a digit`);
+
+    const mark = failures === before_failures ? 'OK  ' : '    ';
+    console.log(`  ${mark}${JSON.stringify(label)}: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+  }
+}
+
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll tests passed\n');
 process.exit(failures ? 1 : 0);
