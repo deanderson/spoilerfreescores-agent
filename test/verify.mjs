@@ -20,6 +20,7 @@ import {
 } from '../src/guard/redaction.js';
 import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
 import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput } from '../src/guard/tools.js';
+import { createScanner, findViolation, createScanTransform, FLOOR_LINE } from '../src/guard/scanner.js';
 
 const [htmlPath, fixturePath] = process.argv.slice(2);
 if (!htmlPath || !fixturePath) {
@@ -492,6 +493,189 @@ console.log('\n6. Schema closure (§8.1 layer 2)');
     }
   }
   console.log(`  ${mustAccept.length} valid inputs accepted, enums match TAG_VOCAB`);
+}
+
+// ── Test 7: output scanner ───────────────────────────────────────────────────
+// §8.1 layer 3, adversarial set per §10.4. Catches HALLUCINATED numbers — the
+// only kind that can reach the model, since layers 1-2 keep real ones out.
+//
+// Both directions matter. A scanner that trips on a poll rank aborts a clean
+// generation, and the pressure to fix that is to weaken it.
+
+console.log('\n7. Output scanner (§8.1 layer 3)');
+{
+  const mustTrip = [
+    'The final was 38-14.',
+    'It ended 38 to 14.',
+    'They won by 3.',
+    'A 2 point margin, decided late.',
+    'Combined 104 points.',
+    'The margin was under 7.',
+    'Texas put up 45.',
+    'It went to 2 overtimes.',
+    'Rushing total was 212 yards.',
+    'Score: 21-20',
+  ];
+  const mustPass = [
+    'A nail-biter between #12 Texas and Oklahoma.',
+    'No. 3 Oregon played a back-and-forth game.',
+    'Both teams are ranked — a good one on Sep 12.',
+    'It ran about 3 to 3.5 hours.',
+    "That's as much as I can give you without ruining it.",
+    'Down to the wire, and it went to overtime.',
+    'Kickoff was 7:30 pm.',
+    'A ranked matchup from the 2026 season.',
+  ];
+
+  let wrong = 0;
+  for (const t of mustTrip) {
+    if (!findViolation(t)) { wrong++; fail('scanner', `missed a violation: ${JSON.stringify(t)}`); }
+  }
+  for (const t of mustPass) {
+    const v = findViolation(t);
+    if (v) { wrong++; fail('scanner', `false positive on ${JSON.stringify(t)} (matched "${v}")`); }
+  }
+  if (!wrong) console.log(`  ${mustTrip.length} violations caught, ${mustPass.length} clean lines passed`);
+
+  // Split deltas: the reason the scanner holds a tail. Emitting per-delta
+  // without one lets "3" + "8" through before either is judged.
+  const splits = [
+    ['The final was ', '3', '8', '-', '1', '4', '.'],
+    ['They ', 'won ', 'by ', 'th', 'ree', ' po', 'ints', ' — 7', ' exactly.'],
+    ['A close one between #', '1', '2', ' Texas and Oklahoma, down to the wire.'],
+  ];
+  const expectTrip = [true, true, false];
+
+  for (let i = 0; i < splits.length; i++) {
+    const s = createScanner();
+    let out = '';
+    let violation = null;
+    for (const d of splits[i]) {
+      const r = s.push(d);
+      out += r.emit;
+      if (r.violation) { violation = r.violation; break; }
+    }
+    if (!violation) { const r = s.flush(); out += r.emit; violation = r.violation; }
+
+    // Keep pushing after a trip: a scanner that forgets it tripped will start
+    // emitting again.
+    if (violation) {
+      const post = s.push(' The margin was 3 and the total was 52.').emit + s.flush().emit;
+      if (post) fail('scanner', `emitted after tripping: ${JSON.stringify(post)}`);
+    }
+
+    if (expectTrip[i] && !violation) {
+      fail('scanner', `split delta not caught: ${JSON.stringify(splits[i].join(''))}`);
+    } else if (!expectTrip[i] && violation) {
+      fail('scanner', `split delta false positive ("${violation}"): ${JSON.stringify(splits[i].join(''))}`);
+    } else if (violation && /\d/.test(out)) {
+      // The point of the tail: nothing containing the offending digits may
+      // already have been emitted when the trip fires.
+      fail('scanner', `emitted digits before tripping: ${JSON.stringify(out)}`);
+    }
+  }
+  console.log(`  ${splits.length} split-delta streams handled, no digits emitted before a trip`);
+
+  // A clean stream must emit its full text, tail included.
+  const clean = 'A back-and-forth game between #8 Texas and Oklahoma on Sep 12.';
+  const s2 = createScanner();
+  let got = '';
+  for (const ch of clean) got += s2.push(ch).emit;
+  got += s2.flush().emit;
+  if (got !== clean) fail('scanner', `clean stream altered:\n        want: ${JSON.stringify(clean)}\n        got:  ${JSON.stringify(got)}`);
+  else console.log('  clean stream passes through byte-identical');
+}
+
+// ── Test 8: scan transform ───────────────────────────────────────────────────
+// The transform is what actually runs in production. Testing findViolation
+// alone leaves the wiring — tail flushing, stopStream, part ordering — unproven.
+
+console.log('\n8. Scan transform (stream wiring)');
+{
+  async function run(parts) {
+    let stopped = false;
+    const seen = [];
+    const t = createScanTransform({
+      stopStream: () => { stopped = true; },
+      onViolation: (v) => seen.push(v),
+    });
+    const out = [];
+    const writer = t.writable.getWriter();
+    const reader = t.readable.getReader();
+    const pump = (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        out.push(value);
+      }
+    })();
+    for (const p of parts) await writer.write(p);
+    await writer.close();
+    await pump;
+    const text = out.filter(p => p.type === 'text-delta').map(p => p.text).join('');
+    return { out, text, stopped, violations: seen };
+  }
+
+  const deltas = (id, chunks) => [
+    { type: 'text-start', id },
+    ...chunks.map(text => ({ type: 'text-delta', id, text })),
+    { type: 'text-end', id },
+  ];
+
+  // Clean stream: passes through whole, nothing stopped, start/end preserved.
+  {
+    const src = 'A back-and-forth game between #8 Texas and Oklahoma on Sep 12. '
+      + 'It ran about 3 to 3.5 hours, kickoff 7:30 pm in the 2026 season.';
+    const r = await run(deltas('t1', src.match(/.{1,7}/g)));
+    if (r.text !== src) fail('transform', `clean text altered: ${JSON.stringify(r.text)}`);
+    if (r.stopped) fail('transform', 'stopStream called on a clean stream');
+    if (r.out[0]?.type !== 'text-start') fail('transform', 'text-start dropped');
+    if (r.out.at(-1)?.type !== 'text-end') fail('transform', 'text-end dropped');
+    if (!r.stopped && r.text === src) console.log('  clean stream: intact, not stopped');
+  }
+
+  // Violation mid-stream. Must be longer than TAIL, or the settled window is
+  // empty for the whole message and only flush() ever trips — which leaves the
+  // delta path untested.
+  {
+    const long = 'It was a back-and-forth game that stayed close throughout, and the final ';
+    const r = await run(deltas('t2', [long, 'score was ', '3', '8', '-14.']));
+    if (!r.violations.length) fail('transform', 'violation not reported');
+    if (/\d/.test(r.text)) fail('transform', `emitted digits: ${JSON.stringify(r.text)}`);
+    if (!r.text.includes(FLOOR_LINE)) fail('transform', 'floor line not emitted');
+    if (!r.stopped) fail('transform', 'stopStream not called on violation');
+    if (r.violations.length && !/\d/.test(r.text) && r.stopped) {
+      console.log(`  violation: stopped, no digits emitted, floor line sent`);
+    }
+  }
+
+  // Parts after a trip must not leak through.
+  {
+    const r = await run([
+      ...deltas('t3', ['They won by ', '3', '.']),
+      { type: 'text-delta', id: 't3', text: ' The margin was 3 points.' },
+      // A NEW part id: the scanner instance for t3 cannot suppress this, so
+      // only the transform's own fired flag stops it.
+      // CLEAN text under a NEW part id: the t3 scanner cannot suppress it and
+      // it holds no digits, so only the transform's own fired flag stops it.
+      ...deltas('t3b', ['It also stayed close down the stretch.']),
+    ]);
+    if (/\d/.test(r.text)) fail('transform', `leaked after trip: ${JSON.stringify(r.text)}`);
+    const after = r.text.slice(r.text.indexOf(FLOOR_LINE) + FLOOR_LINE.length);
+    if (!r.text.includes(FLOOR_LINE)) fail('transform', 'floor line missing on trip');
+    else if (after.trim()) fail('transform', `emitted text after the floor line: ${JSON.stringify(after)}`);
+    else console.log('  post-trip parts suppressed');
+  }
+
+  // Non-text parts pass through untouched.
+  {
+    const r = await run([
+      { type: 'tool-input-start', id: 'x', toolName: 'search_games' },
+      ...deltas('t4', ['Down to the wire.']),
+    ]);
+    if (!r.out.some(p => p.type === 'tool-input-start')) fail('transform', 'tool part dropped');
+    else console.log('  non-text parts pass through');
+  }
 }
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll tests passed\n');

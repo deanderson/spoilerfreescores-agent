@@ -1,206 +1,164 @@
 import { createWorkersAI } from "workers-ai-provider";
-import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
+import { routeAgentRequest } from "agents";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
+import { convertToModelMessages, pruneMessages, stepCountIs, streamText, tool } from "ai";
+import type { TextStreamPart, ToolSet } from "ai";
+
+import { createScanTransform } from "./guard/scanner.js";
 import {
-  convertToModelMessages,
-  pruneMessages,
-  stepCountIs,
-  streamText,
-  tool
-} from "ai";
-import { z } from "zod";
+  searchGamesInput,
+  watchOptionsInput,
+  savePreferenceInput,
+  TOOL_DESCRIPTIONS,
+  searchGames,
+  toResult,
+} from "./guard/tools.js";
+
+const SPORT = "ncaaf";
+
+// Durable preferences (§7). Namespaced so it cannot collide with whatever
+// AIChatAgent uses for message persistence — verify with a storage.list()
+// before trusting this on a populated DO.
+const PREFS_KEY = "sfs:prefs:v1";
+
+// Per-sport runtime estimate. Volunteered, never filtered on — every NCAAF
+// game lands in the same bucket, so it is metadata, not a dimension.
+const RUNTIME_ESTIMATE = "about 3 to 3.5 hours, longer if it went to overtime";
+
+type Prefs = Record<string, { value: string; liked: boolean }>;
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
   chatRecovery = true;
-  // Wait for MCP connections to be re-established after hibernation before
-  // processing a message, so MCP tools aren't intermittently missing.
-  waitForMcpConnections = true;
 
-  onStart() {
-    // Configure OAuth popup behavior for MCP servers that require authentication
-    this.mcp.configureOAuthCallback({
-      customHandler: (result) => {
-        if (result.authSuccess) {
-          return new Response("<script>window.close();</script>", {
-            headers: { "content-type": "text/html" },
-            status: 200
-          });
-        }
-        return new Response(
-          `Authentication Failed: ${result.authError || "Unknown error"}`,
-          { headers: { "content-type": "text/plain" }, status: 400 }
-        );
-      }
-    });
-  }
+  // MCP is removed, not disabled. An MCP server is an uncontrolled tool
+  // surface: it can return arbitrary content straight into the model's
+  // context, which defeats the point of building three enforcement layers
+  // around what the model is allowed to see. Nothing in the spec needs it.
 
-  @callable()
-  async addServer(name: string, url: string) {
-    return await this.addMcpServer(name, url);
-  }
-
-  @callable()
-  async removeServer(serverId: string) {
-    await this.removeMcpServer(serverId);
+  private async loadPrefs(): Promise<Prefs> {
+    return (await this.ctx.storage.get<Prefs>(PREFS_KEY)) ?? {};
   }
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
-    const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({ binding: this.env.AI });
+    const workersai = createWorkersAI({
+      binding: this.env.AI,
+      gateway: { id: "sfs-agent" },
+    });
+
+    const prefs = await this.loadPrefs();
+    const prefLines = Object.entries(prefs)
+      .map(([k, v]) => `- ${k}: ${v.value} (${v.liked ? "likes" : "dislikes"})`)
+      .join("\n");
 
     const result = streamText({
       model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-        sessionAffinity: this.sessionAffinity
+        sessionAffinity: this.sessionAffinity,
       }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
-${getSchedulePrompt({ date: new Date() })}
+      system: `You recommend college football games worth watching, without spoiling them.
 
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
-      // Prune old tool calls and reasoning to save tokens on long conversations
+You never learn the score of any game. You genuinely do not have it — the data
+you can reach has been stripped of scores, margins, and totals before it gets to
+you. If a user asks for a score, say plainly that you do not have it and would
+not give it if you did, because the whole point is deciding what to watch.
+
+Never state or invent a number describing play: no scores, margins, totals,
+yardage, or counts of anything that happened. Ranks and dates are fine.
+
+Describe a game using the phrases and qualities the tools give you, and nothing
+beyond them. If a game came back tagged "competitive" and the user asked for a
+nail-biter, say so — offer what you have rather than pretending it matches.
+
+You cannot tell whether a game exists that you were not shown. Never say a team
+has no good games, that nothing matched, or that you filtered anything out. You
+have no way to know any of that, and saying it would reveal how those games
+turned out. Offer what you have instead.
+
+Most games have only one or two things worth saying. When a user pushes for
+more, the honest answer is that there is not much more to tell — not a
+withheld detail. Say something like "that's about as much as I can give you
+without ruining it."
+
+Typical runtime for these games is ${RUNTIME_ESTIMATE}.
+
+${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
+
+      // Tool-call pruning is OFF for recall. The disclosure ladder (§5) assumes
+      // the model still has the safe view it was handed earlier in the session;
+      // prune it and the model either re-calls or invents. Reasoning pruning is
+      // harmless and stays.
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
-        toolCalls: "before-last-2-messages",
-        reasoning: "before-last-message"
+        reasoning: "before-last-message",
       }),
+
       tools: {
-        // MCP tools from connected servers
-        ...mcpTools,
+        search_games: tool({
+          description: TOOL_DESCRIPTIONS.search_games,
+          inputSchema: searchGamesInput,
+          execute: async (args) => {
+            // Read the whole corpus and rank in memory. The corpus is bounded
+            // by retention (~45-200 rows), and ranking in SQL would mean
+            // building a WHERE clause — which is exactly the thing that turns
+            // this tool into an oracle.
+            const { results } = await this.env.DB.prepare(
+              `SELECT * FROM games WHERE sport = ?`
+            ).bind(SPORT).all();
 
-        // Server-side tool: runs automatically on the server
-        getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
-          }),
-          execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
+            return searchGames(results as any[], args);
+          },
+        }),
+
+        get_watch_options: tool({
+          description: TOOL_DESCRIPTIONS.get_watch_options,
+          inputSchema: watchOptionsInput,
+          execute: async ({ id }) => {
+            const row = await this.env.DB.prepare(
+              `SELECT id, home, away, league, date, broadcast, watch_name, watch_url,
+                      collinsworth_warning, overtime
+                 FROM games WHERE id = ? AND sport = ?`
+            ).bind(id, SPORT).first();
+
+            if (!row) return { watch: null, runtime: RUNTIME_ESTIMATE };
+
             return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
+              watch: {
+                broadcast: (row as any).broadcast ?? null,
+                provider: (row as any).watch_name ?? null,
+                url: (row as any).watch_url ?? null,
+              },
+              runtime: RUNTIME_ESTIMATE,
             };
-          }
+          },
         }),
 
-        // Client-side tool: no execute function — the browser handles it
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
+        save_preference: tool({
+          description: TOOL_DESCRIPTIONS.save_preference,
+          inputSchema: savePreferenceInput,
+          execute: async ({ key, value, liked }) => {
+            const prefs = await this.loadPrefs();
+            prefs[key] = { value, liked };
+            await this.ctx.storage.put(PREFS_KEY, prefs);
+            return { saved: key };
+          },
         }),
-
-        // Approval tool: requires user confirmation before executing
-        calculate: tool({
-          description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
-          }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
-            };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
-            };
-          }
-        }),
-
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
-            const input =
-              when.type === "scheduled"
-                ? when.date
-                : when.type === "delayed"
-                  ? when.delayInSeconds
-                  : when.type === "cron"
-                    ? when.cron
-                    : null;
-            if (!input) return "Invalid schedule type";
-            try {
-              this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
-            } catch (error) {
-              return `Error scheduling task: ${error}`;
-            }
-          }
-        }),
-
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
-          inputSchema: z.object({}),
-          execute: async () => {
-            const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
-          }
-        }),
-
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
-          inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
-          }),
-          execute: async ({ taskId }) => {
-            try {
-              this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
-            } catch (error) {
-              return `Error cancelling task: ${error}`;
-            }
-          }
-        })
       },
-      stopWhen: stepCountIs(20),
-      abortSignal: options?.abortSignal
+
+      // Layer 3 (§8.1). Runs on typed parts before protocol encoding, so it
+      // never touches the wire format. The transform itself lives in guard/ so
+      // it can be tested under plain node.
+      experimental_transform: ({ stopStream }) =>
+        createScanTransform({
+          stopStream,
+          onViolation: (v) => console.warn(`[scanner] blocked hallucinated number: ${v}`),
+        }) as unknown as TransformStream<TextStreamPart<ToolSet>, TextStreamPart<ToolSet>>,
+
+      stopWhen: stepCountIs(10),
+      abortSignal: options?.abortSignal,
     });
 
     return result.toUIMessageStreamResponse();
-  }
-
-  async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
-    console.log(`Executing scheduled task: ${description}`);
-
-    // Notify connected clients via a broadcast event.
-    // We use broadcast() instead of saveMessages() to avoid injecting
-    // into chat history — that would cause the AI to see the notification
-    // as new context and potentially loop.
-    this.broadcast(
-      JSON.stringify({
-        type: "scheduled-task",
-        description,
-        timestamp: new Date().toISOString()
-      })
-    );
   }
 }
 
@@ -210,5 +168,5 @@ export default {
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
     );
-  }
+  },
 } satisfies ExportedHandler<Env>;
