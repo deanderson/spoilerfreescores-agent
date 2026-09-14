@@ -18,6 +18,8 @@ import {
   INSIGHT_MAP, WORKER_OVERRIDES, formatDynamicLabel,
   getInsightPhrases, buildSafeView, TIER1_FIELDS,
 } from '../src/guard/redaction.js';
+import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
+import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput } from '../src/guard/tools.js';
 
 const [htmlPath, fixturePath] = process.argv.slice(2);
 if (!htmlPath || !fixturePath) {
@@ -260,6 +262,236 @@ console.log('\n4. Override coverage (synthetic)');
     const mark = failures === before_failures ? 'OK  ' : '    ';
     console.log(`  ${mark}${JSON.stringify(label)}: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
   }
+}
+
+// ── Test 5: oracle resistance ────────────────────────────────────────────────
+// §6.1. This is the test that fails if someone turns prefer_teams back into a
+// WHERE clause. The property is not "empty results are handled nicely" — it is
+// that result-set size carries no information about the query at all.
+//
+// A prompt instruction cannot achieve this. If the tool can return fewer games
+// for one team than another, the user learns something about that team's games
+// no matter what the model is told to say.
+
+console.log('\n5. Oracle resistance (team boost, §6.1)');
+{
+  const corpus = [];
+  for (const g of games) {
+    const view = buildSafeView(g, SPORT);
+    if (!view) continue;
+    const tags = deriveTags(g, SPORT);
+    if (!tags) continue;
+    corpus.push({
+      id: view.id, home: view.home, away: view.away, league: view.league,
+      date: view.date, ts: view.ts,
+      home_rank: view.homeRank ?? null, away_rank: view.awayRank ?? null,
+      cls: view.cls, ...tags, overtime: tags.overtime ? 1 : 0,
+      phrases: JSON.stringify(view.phrases),
+    });
+  }
+
+  // 5a. The corpus must clear the floor, or nothing below is meaningful.
+  if (corpus.length < MIN_CORPUS) {
+    fail('oracle', `corpus ${corpus.length} below MIN_CORPUS ${MIN_CORPUS} — `
+      + `result size starts tracking the query; the rest of this test is void`);
+  }
+  const EXPECT = Math.min(5, corpus.length); // RESULT_LIMIT, asserted by observation below
+
+  // 5b. Every team in the RAW feed — including teams whose games were all
+  //     excluded at ingest — must produce an identically sized result.
+  //     Those excluded teams are the whole point: they are the ones a hard
+  //     filter would betray.
+  const inCorpus = new Set(corpus.flatMap(r => [r.home, r.away]));
+  const allTeams = [...new Set(games.flatMap(g => [g.home, g.away]).filter(Boolean))];
+  const excluded = allTeams.filter(t => !inCorpus.has(t));
+
+  const sizes = new Map();
+  for (const team of allTeams) {
+    const n = searchGames(corpus, { prefer_teams: [team] }).games.length;
+    if (!sizes.has(n)) sizes.set(n, []);
+    sizes.get(n).push(team);
+  }
+  if (sizes.size === 1 && sizes.has(EXPECT)) {
+    console.log(`  ${allTeams.length} teams probed (${excluded.length} with zero `
+      + `recommendable games) — all return ${EXPECT}`);
+  } else {
+    for (const [n, teams] of sizes) {
+      if (n !== EXPECT) {
+        fail('oracle', `${teams.length} team(s) return ${n} results, not ${EXPECT} `
+          + `— e.g. ${JSON.stringify(teams.slice(0, 3))}. prefer_teams is excluding.`);
+      }
+    }
+  }
+
+  // 5c. Same property across every enum value, including combinations that
+  //     match nothing. A filter that excludes shows up here even if teams
+  //     were left alone.
+  // Full cartesian product. Single-dimension probes are useless here: every
+  // enum value has at least 5 games behind it, so a hard filter still fills
+  // RESULT_LIMIT and the test passes. Only combinations empty out.
+  const probes = [];
+  for (const c of [undefined, ...TAG_VOCAB.competitiveness])
+    for (const sc of [undefined, ...TAG_VOCAB.scoring])
+      for (const ot of [undefined, true, false])
+        for (const rk of [undefined, ...TAG_VOCAB.ranked])
+          for (const rc of [undefined, 'latest_slate', 'this_week']) {
+            const p = {};
+            if (c) p.competitiveness = c;
+            if (sc) p.scoring = sc;
+            if (ot !== undefined) p.overtime = ot;
+            if (rk) p.ranked = rk;
+            if (rc) p.recency = rc;
+            probes.push(p);
+          }
+  // Plus the same grid narrowed to teams with nothing recommendable.
+  for (const p of probes.slice(0, 24)) probes.push({ ...p, prefer_teams: excluded.slice(0, 2) });
+
+  let varied = 0;
+  const seenSizes = new Map();
+  for (const p of probes) {
+    const n = searchGames(corpus, p).games.length;
+    if (n !== EXPECT) {
+      varied++;
+      if (!seenSizes.has(n)) seenSizes.set(n, p);
+    }
+  }
+  if (varied) {
+    for (const [n, p] of seenSizes) {
+      fail('oracle', `${varied} probe(s) returned a size other than ${EXPECT}; `
+        + `e.g. ${n} for ${JSON.stringify(p)} — a filter is excluding`);
+      break;
+    }
+  } else {
+    console.log(`  ${probes.length} enum-combination probes — all return ${EXPECT}`);
+  }
+
+  // 5c-bis. The sweep above cannot catch a filter on a single dimension: every
+  //     enum value has 7-20 games behind it, so excluding on one still fills
+  //     RESULT_LIMIT. Detection needs a corpus at the floor, where any
+  //     exclusion at all shows up. Tags are spread so that no single value
+  //     covers 5 games.
+  const minimal = ['nail_biter', 'close', 'competitive', 'nail_biter', 'close']
+    .map((comp, i) => ({
+      id: `m${i}`, home: `Home ${i}`, away: `Away ${i}`, league: 'FBS', date: 'd',
+      ts: Date.now() - i * 86_400_000, home_rank: null, away_rank: null,
+      cls: i === 0 ? 'watchworthy' : 'watchable',
+      competitiveness: comp,
+      scoring: i % 2 ? 'shootout' : 'balanced',
+      overtime: i % 3 === 0 ? 1 : 0,
+      ranked: ['neither', 'one', 'both'][i % 3],
+      runtime_bucket: 'over_3h', phrases: '[]',
+    }));
+
+  let minVaried = 0;
+  for (const p of probes) {
+    const n = searchGames(minimal, p).games.length;
+    if (n !== minimal.length) {
+      minVaried++;
+      if (minVaried === 1) {
+        fail('oracle', `at-floor corpus: probe returned ${n} of ${minimal.length} for `
+          + `${JSON.stringify(p)} — a filter is excluding`);
+      }
+    }
+  }
+  if (!minVaried) {
+    console.log(`  same ${probes.length} probes against a ${minimal.length}-game corpus `
+      + `(at MIN_CORPUS) — all return ${minimal.length}`);
+  }
+
+  // 5d. The return shape must have no field capable of expressing absence.
+  //     Checked structurally rather than by inspection, so a field added later
+  //     to be helpful trips this.
+  const FORBIDDEN = ['total', 'count', 'matched', 'relaxed', 'message', 'empty', 'note'];
+  const sample = searchGames(corpus, { prefer_teams: excluded.slice(0, 1) });
+  const top = Object.keys(sample);
+  for (const f of FORBIDDEN) {
+    if (top.includes(f)) fail('oracle', `result carries "${f}" — the model can report absence`);
+  }
+  if (top.length !== 1 || top[0] !== 'games') {
+    fail('oracle', `result has keys ${JSON.stringify(top)}; expected only ["games"]`);
+  }
+
+  // 5e. Recency must anchor to the corpus, not the clock.
+  //
+  //     The fixture cannot test this. The sort already tie-breaks on ts
+  //     descending, so an unapplied recency boost still yields newest-first,
+  //     and the latest slate holds 6 watchworthy games which fill the top 5 on
+  //     tier alone. Corpus-anchored and clock-relative produce identical
+  //     output on real data. Two earlier versions of this check — one on size,
+  //     one on content — both passed against a clock-relative implementation.
+  //
+  //     So: synthetic corpus built to discriminate. One OLD watchworthy game
+  //     against five NEWER watchable ones. The recency boost (5) outranks the
+  //     category tier (2), so an anchored implementation puts the new games on
+  //     top; a clock-relative one applies no boost at all and tier wins.
+  const base = Date.now() - 40 * 86_400_000;
+  const synth = [
+    { id: 'old', home: 'Old A', away: 'Old B', league: 'FBS', date: 'old',
+      ts: base, home_rank: null, away_rank: null, cls: 'watchworthy',
+      competitiveness: 'close', scoring: 'balanced', overtime: 0, ranked: 'neither',
+      runtime_bucket: 'over_3h', phrases: '[]' },
+    ...Array.from({ length: 5 }, (_, i) => ({
+      id: `new${i}`, home: `New ${i}`, away: `Opp ${i}`, league: 'FBS', date: 'new',
+      ts: base + 30 * 86_400_000 + i, home_rank: null, away_rank: null, cls: 'watchable',
+      competitiveness: 'close', scoring: 'balanced', overtime: 0, ranked: 'neither',
+      runtime_bucket: 'over_3h', phrases: '[]' })),
+  ];
+  const synthTop = searchGames(synth, { recency: 'latest_slate' }).games[0];
+  if (synthTop.id === 'old') {
+    fail('oracle', 'recency is clock-relative: an older watchworthy game outranks the '
+      + 'latest slate, so the boost never applied');
+  } else {
+    console.log('  recency anchored to corpus — latest slate outranks an older '
+      + 'watchworthy game');
+  }
+}
+
+// ── Test 6: schema closure ───────────────────────────────────────────────────
+// The tool schema is the second enforcement layer (§8.1). It is only a layer if
+// it actually rejects. These are the arguments a jailbroken model would try:
+// a numeric threshold, a raw field name, an invented preference key.
+
+console.log('\n6. Schema closure (§8.1 layer 2)');
+{
+  const mustReject = [
+    ['numeric margin threshold',  searchGamesInput, { margin_under: 5 }],
+    ['raw score field',           searchGamesInput, { h: 38, a: 14 }],
+    ['factors passthrough',       searchGamesInput, { factors: true }],
+    ['out-of-vocab enum',         searchGamesInput, { competitiveness: 'blowout' }],
+    ['enum as free text',         searchGamesInput, { scoring: '65+' }],
+    ['limit override',            searchGamesInput, { limit: 500 }],
+    ['unbounded team list',       searchGamesInput, { prefer_teams: Array(50).fill('x') }],
+    ['invented preference key',   savePreferenceInput, { key: 'margin', value: '3', liked: true }],
+    ['preference without liked',  savePreferenceInput, { key: 'scoring', value: 'shootout' }],
+  ];
+
+  let leaked = 0;
+  for (const [name, schema, input] of mustReject) {
+    if (schema.safeParse(input).success) {
+      leaked++;
+      fail('schema', `accepted ${name}: ${JSON.stringify(input)}`);
+    }
+  }
+  if (!leaked) console.log(`  ${mustReject.length} hostile inputs, all rejected`);
+
+  const mustAccept = [
+    [searchGamesInput, {}],
+    [searchGamesInput, { competitiveness: 'nail_biter', overtime: true }],
+    [searchGamesInput, { prefer_teams: ['Temple Owls'], recency: 'latest_slate' }],
+    [savePreferenceInput, { key: 'teams', value: 'Texas Longhorns', liked: false }],
+  ];
+  for (const [schema, input] of mustAccept) {
+    const r = schema.safeParse(input);
+    if (!r.success) fail('schema', `rejected a valid input: ${JSON.stringify(input)}`);
+  }
+
+  // The enums must track TAG_VOCAB rather than being a second copy that drifts.
+  for (const v of TAG_VOCAB.competitiveness) {
+    if (!searchGamesInput.safeParse({ competitiveness: v }).success) {
+      fail('schema', `TAG_VOCAB has "${v}" but the tool schema rejects it — vocabularies drifted`);
+    }
+  }
+  console.log(`  ${mustAccept.length} valid inputs accepted, enums match TAG_VOCAB`);
 }
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll tests passed\n');

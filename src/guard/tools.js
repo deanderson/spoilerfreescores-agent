@@ -8,6 +8,7 @@
  * learn that a set is empty at team granularity.
  */
 
+import { z } from 'zod';
 import { TAG_VOCAB } from './tags.js';
 
 const RESULT_LIMIT = 5;
@@ -19,72 +20,56 @@ export const MIN_CORPUS = RESULT_LIMIT;
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
 
-export const TOOL_SCHEMAS = [
-  {
-    name: 'search_games',
-    description:
-      'Find completed games worth watching. Returns games with their qualities. '
-      + 'Each returned game carries its own tags — read them to describe what you '
-      + 'are offering. There is no count and no total; do not infer one.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        // Closed enums only. Free-text here would let the model pass a
-        // threshold ("margin under 5") and turn the tool into a binary search.
-        competitiveness: { type: 'string', enum: TAG_VOCAB.competitiveness },
-        scoring:         { type: 'string', enum: TAG_VOCAB.scoring },
-        overtime:        { type: 'boolean' },
-        ranked:          { type: 'string', enum: TAG_VOCAB.ranked },
-        recency:         { type: 'string', enum: ['latest_slate', 'this_week'] },
+// Zod, not raw JSON Schema: the AI SDK (ai@6) takes `inputSchema` as a zod
+// schema. z.enum gives the same closed vocabulary the JSON enum did, and
+// .strict() the same additionalProperties:false. Notation changed, guarantee
+// did not.
+//
+// These live here rather than in server.ts so the closed vocabulary is
+// testable under plain node, alongside the resolvers it constrains.
 
-        // Teams and leagues BOOST ordering. They never exclude.
-        // This is the structural fix for §6.1: a hard team filter that returns
-        // nothing tells the user their team's games were blowouts. A boost
-        // cannot, because the tool always returns the same number of games
-        // regardless of whether the team matched.
-        prefer_teams:    { type: 'array', items: { type: 'string' }, maxItems: 4 },
-        prefer_leagues:  { type: 'array', items: { type: 'string' }, maxItems: 4 },
-      },
-      additionalProperties: false,
-    },
-  },
+export const searchGamesInput = z.object({
+  // Closed enums only. A free-text field here would let the model pass a
+  // threshold ("margin under 5") and turn the tool into a binary search.
+  competitiveness: z.enum(TAG_VOCAB.competitiveness).optional(),
+  scoring:         z.enum(TAG_VOCAB.scoring).optional(),
+  overtime:        z.boolean().optional(),
+  ranked:          z.enum(TAG_VOCAB.ranked).optional(),
+  recency:         z.enum(['latest_slate', 'this_week']).optional(),
 
-  {
-    name: 'get_watch_options',
-    description:
-      'Where and how to watch a specific game, plus an estimated runtime. '
-      + 'Does not return anything about what happened in the game.',
-    input_schema: {
-      type: 'object',
-      properties: { id: { type: 'string' } },
-      required: ['id'],
-      additionalProperties: false,
-    },
-  },
+  // Teams and leagues BOOST ordering. They never exclude. This is the
+  // structural fix for §6.1: a hard team filter that returns nothing tells the
+  // user their team's games were blowouts. A boost cannot, because the tool
+  // returns the same number of games either way.
+  prefer_teams:    z.array(z.string()).max(4).optional(),
+  prefer_leagues:  z.array(z.string()).max(4).optional(),
+}).strict();
 
-  {
-    name: 'save_preference',
-    description:
-      'Record a DURABLE preference the user expressed about what they enjoy. '
-      + 'Do not use for constraints scoped to this request ("tonight", "this '
-      + 'weekend") — those are not preferences and must not persist.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        // Closed key vocabulary. Free-text keys let the model invent dimensions
-        // the filter cannot act on, which then silently do nothing.
-        key: {
-          type: 'string',
-          enum: ['competitiveness', 'scoring', 'overtime', 'ranked', 'teams', 'leagues'],
-        },
-        value: { type: 'string' },
-        liked: { type: 'boolean', description: 'false records a dislike' },
-      },
-      required: ['key', 'value', 'liked'],
-      additionalProperties: false,
-    },
-  },
-];
+export const watchOptionsInput = z.object({
+  id: z.string(),
+}).strict();
+
+export const savePreferenceInput = z.object({
+  // Closed key vocabulary. Free-text keys let the model record dimensions the
+  // filter cannot act on, so the §7 durable/per-query split fails silently.
+  key: z.enum(['competitiveness', 'scoring', 'overtime', 'ranked', 'teams', 'leagues']),
+  value: z.string(),
+  liked: z.boolean(),
+}).strict();
+
+export const TOOL_DESCRIPTIONS = {
+  search_games:
+    'Find completed games worth watching. Returns games with their qualities. '
+    + 'Each returned game carries its own tags — read them to describe what you '
+    + 'are offering. There is no count and no total; do not infer one.',
+  get_watch_options:
+    'Where and how to watch a specific game, plus an estimated runtime. '
+    + 'Does not return anything about what happened in the game.',
+  save_preference:
+    'Record a DURABLE preference the user expressed about what they enjoy. '
+    + 'Do not use for constraints scoped to this request ("tonight", "this '
+    + 'weekend") — those are not preferences and must not persist.',
+};
 
 // ── Return shapes ────────────────────────────────────────────────────────────
 //
