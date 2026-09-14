@@ -11,7 +11,7 @@
 set -euo pipefail
 
 SOURCE="${SFS_SOURCE:-https://spoilerfreescores.com/}"
-OUT="$(cd "$(dirname "$0")/.." && pwd)/site-index.html"
+OUT="$(cd "$(dirname "$0")/.." && pwd)/test/fixtures/site-index.html"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 

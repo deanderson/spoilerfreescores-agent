@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import {
   INSIGHT_MAP, WORKER_OVERRIDES, formatDynamicLabel,
   getInsightPhrases, buildSafeView, TIER1_FIELDS,
-} from './redaction.js';
+} from '../src/guard/redaction.js';
 
 const [htmlPath, fixturePath] = process.argv.slice(2);
 if (!htmlPath || !fixturePath) {
