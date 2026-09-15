@@ -161,3 +161,63 @@ export function searchGames(rows, args = {}) {
 
   return { games: scored.slice(0, RESULT_LIMIT).map(s => toResult(s.row)) };
 }
+
+// ── Tool input repair ────────────────────────────────────────────────────────
+
+/**
+ * Narrow repair for tool arguments the model gets *typed* wrong.
+ *
+ * Llama sends `{"overtime": "true"}` — the string, where the schema wants a
+ * boolean. The call is rejected, the model retries, and the user watches error
+ * cards until one attempt happens to be well typed.
+ *
+ * This ONLY fixes types. It never coerces a value into the enum vocabulary:
+ * an out-of-vocabulary `competitiveness` stays rejected, because accepting it
+ * would mean layer 2 no longer closes the vocabulary (§8.1). The distinction
+ * matters — "true" and true are the same value in two encodings, whereas
+ * "blowout" and "competitive" are different claims.
+ *
+ * @returns repaired arguments object, or null when nothing safe can be done.
+ */
+export function repairToolInput(schema, rawInput) {
+  let obj;
+  if (typeof rawInput === 'string') {
+    try { obj = JSON.parse(rawInput); } catch { return null; }
+  } else if (rawInput && typeof rawInput === 'object') {
+    obj = { ...rawInput };
+  } else {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+
+  const fixed = { ...obj };
+
+  // String -> boolean, for exactly the two literals. "yes"/"1" are NOT
+  // accepted: they are guesses about intent, not a different encoding of the
+  // same value.
+  for (const key of ['overtime']) {
+    const v = fixed[key];
+    if (v === 'true') fixed[key] = true;
+    else if (v === 'false') fixed[key] = false;
+  }
+
+  // A single string where an array is expected is an encoding difference too.
+  for (const key of ['prefer_teams', 'prefer_leagues']) {
+    if (typeof fixed[key] === 'string') fixed[key] = [fixed[key]];
+  }
+
+  // Drop keys the schema does not know, so one fabricated key does not sink an
+  // otherwise valid call. But if NOTHING known survives, refuse: turning
+  // {"margin_under": 5} into {} would let a numeric-threshold probe quietly
+  // succeed as an unfiltered search, and layer 2 would no longer visibly
+  // reject out-of-vocabulary input.
+  const known = new Set(Object.keys(schema.shape ?? {}));
+  const hadKeys = Object.keys(fixed).length > 0;
+  for (const key of Object.keys(fixed)) {
+    if (!known.has(key)) delete fixed[key];
+  }
+  if (hadKeys && Object.keys(fixed).length === 0) return null;
+
+  const result = schema.safeParse(fixed);
+  return result.success ? result.data : null;
+}

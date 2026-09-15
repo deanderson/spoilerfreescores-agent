@@ -19,7 +19,7 @@ import {
   getInsightPhrases, buildSafeView, TIER1_FIELDS,
 } from '../src/guard/redaction.js';
 import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
-import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput } from '../src/guard/tools.js';
+import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput, repairToolInput } from '../src/guard/tools.js';
 import { createScanner, findViolation, createScanTransform, FLOOR_LINE } from '../src/guard/scanner.js';
 import { dedupeAIStream, rewriteFrame, createFrameWatcher } from '../src/ai-stream-fix.js';
 
@@ -829,6 +829,55 @@ console.log('\n9. Workers AI stream dedupe');
       console.log('  frame watcher distinguishes complete from truncated streams');
     }
   }
+}
+
+// ── Test 10: tool input repair ───────────────────────────────────────────────
+// Llama sends {"overtime": "true"} — the string — and the call is rejected,
+// so the user watches error cards until an attempt happens to be well typed.
+// Repair fixes ENCODING only. It must never coerce a value into the enum
+// vocabulary, or layer 2 stops closing it.
+
+console.log('\n10. Tool input repair (§8.1 layer 2)');
+{
+  const repairs = [
+    ['string boolean',        '{"overtime": "true"}',                          { overtime: true }],
+    ['string false',          '{"overtime": "false"}',                         { overtime: false }],
+    ['scalar for array',      '{"prefer_teams": "Texas"}',                     { prefer_teams: ['Texas'] }],
+    ['mixed valid + typo',    '{"competitiveness": "nail_biter", "overtime": "true"}',
+                              { competitiveness: 'nail_biter', overtime: true }],
+    ['drops unknown key',     '{"margin_under": 5, "overtime": "true"}',       { overtime: true }],
+  ];
+  for (const [name, input, want] of repairs) {
+    const got = repairToolInput(searchGamesInput, input);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      fail('repair', `${name}: want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+    }
+  }
+
+  // MUST NOT repair. Each of these would widen what the model can express.
+  const mustNotRepair = [
+    ['out-of-vocab enum',     '{"competitiveness": "blowout"}'],
+    ['numeric threshold',     '{"margin_under": 5}'],
+    ['truthy guess',          '{"overtime": "yes"}'],
+    ['truthy number',         '{"overtime": 1}'],
+    ['raw score field',       '{"h": 38, "a": 14}'],
+    ['not json',              'not json'],
+    ['array input',           '[1,2,3]'],
+  ];
+  for (const [name, input] of mustNotRepair) {
+    const got = repairToolInput(searchGamesInput, input);
+    if (got !== null) fail('repair', `${name}: repaired when it should not have: ${JSON.stringify(got)}`);
+  }
+
+  // A repaired call must still satisfy the schema it was repaired against.
+  for (const [, input] of repairs) {
+    const got = repairToolInput(searchGamesInput, input);
+    if (got && !searchGamesInput.safeParse(got).success) {
+      fail('repair', `repair produced schema-invalid output: ${JSON.stringify(got)}`);
+    }
+  }
+
+  console.log(`  ${repairs.length} type repairs applied, ${mustNotRepair.length} refused`);
 }
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll tests passed\n');
