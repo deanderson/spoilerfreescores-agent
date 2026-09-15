@@ -17,7 +17,7 @@
     "types": "wrangler types env.d.ts",
     "format": "oxfmt --write .",
     "lint": "oxlint src/",
-    "check": "oxfmt --check . && oxlint src/ && tsc",
+    "check": "npm run verify && tsc --noEmit",
     "verify": "node test/verify.mjs test/fixtures/site-index.html test/fixtures/ncaaf.json",
     "snapshot": "./scripts/refresh-snapshot.sh"
   },

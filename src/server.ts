@@ -2,7 +2,6 @@ import { createWorkersAI } from "workers-ai-provider";
 import { routeAgentRequest } from "agents";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import { convertToModelMessages, pruneMessages, stepCountIs, streamText, tool } from "ai";
-import type { TextStreamPart, ToolSet } from "ai";
 
 import { createScanTransform } from "./guard/scanner.js";
 import { dedupeAIStream, createFrameWatcher } from "./ai-stream-fix.js";
@@ -115,9 +114,24 @@ not give it if you did, because the whole point is deciding what to watch.
 Never state or invent a number describing play: no scores, margins, totals,
 yardage, or counts of anything that happened. Ranks and dates are fine.
 
-Describe a game using the phrases and qualities the tools give you, and nothing
-beyond them. If a game came back tagged "competitive" and the user asked for a
-nail-biter, say so — offer what you have rather than pretending it matches.
+HOW TO ANSWER FIRST. Each game comes with a "line" already written. Emit those
+lines exactly as given, one per line, and nothing else — no preamble, no
+closing sentence, no date, no extra quality, no reordering of the words. You
+are not composing the list; you are passing it through.
+
+Then WAIT. Do not volunteer more. The user picks what they want to hear about,
+and you answer about that game. Holding the rest back is the whole point: give
+it all away at once and there is nothing left to decide.
+
+Never use the tags as words. They are internal labels, not English. Never write
+"balanced scoring", "nail_biter", or "shootout scoring". Each game's "phrases"
+are already written for a reader — use those. If you need to describe a quality
+that has no phrase, say it in plain English ("it stayed close", "it went to
+overtime"), never by naming the tag.
+
+When a user asks about a specific game, you can give the rest of its phrases
+and its other qualities. That is the second rung, and it is where the detail
+lives.
 
 You cannot tell whether a game exists that you were not shown. Never say a team
 has no good games, that nothing matched, or that you filtered anything out. You
@@ -161,6 +175,14 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
               const { results } = await this.env.DB.prepare(
                 `SELECT * FROM games WHERE sport = ?`
               ).bind(SPORT).all();
+
+              // One line per turn, not per token. Tells you which call actually
+              // reached execute() — with retries in play, the tool card in the
+              // UI does not.
+              console.log(
+                `[search_games] rows=${results?.length ?? 'none'} args=${JSON.stringify(args)}` +
+                ` gatewayLog=${(this.env.AI as any)?.aiGatewayLogId ?? 'none'}`,
+              );
 
               return searchGames(results as any[], args);
             } catch (err) {
@@ -220,8 +242,14 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
       experimental_transform: ({ stopStream }) =>
         createScanTransform({
           stopStream,
-          onViolation: (v) => console.warn(`[scanner] blocked hallucinated number: ${v}`),
-        }) as unknown as TransformStream<TextStreamPart<ToolSet>, TextStreamPart<ToolSet>>,
+          onViolation: (v: string) =>
+            console.warn(`[scanner] blocked hallucinated number: ${v}`),
+          // `as any`: streamText binds the transform's generic to this exact
+          // tool set, and the scanner is deliberately generic — it only ever
+          // inspects text-delta parts and passes everything else through
+          // untouched, so it cannot be typed against a specific ToolSet
+          // without lying about what it handles.
+        }) as any,
 
       // A rejected tool call is otherwise invisible: the model sees a generic
       // error card and execute() never runs, so neither a try/catch in the tool
@@ -247,7 +275,11 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
         // enum is NOT repaired — it stays rejected, because accepting it would
         // mean the schema no longer closes the vocabulary.
         if (!repaired) return null;
-        return { ...call, input: JSON.stringify(repaired) };
+
+        // Cast back to the call's own type: the SDK models tool calls as a
+        // union discriminated on `dynamic`, and spreading widens it in a way
+        // the union will not accept. Only `input` changes.
+        return { ...call, input: JSON.stringify(repaired) } as typeof toolCall;
       },
 
       // Errors above execute() — invalid tool input, unknown tool, provider

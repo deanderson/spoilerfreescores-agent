@@ -19,7 +19,7 @@ import {
   getInsightPhrases, buildSafeView, TIER1_FIELDS,
 } from '../src/guard/redaction.js';
 import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
-import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput, repairToolInput } from '../src/guard/tools.js';
+import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput, repairToolInput, CATEGORY_LABEL, toResult, RECOMMENDABLE_CLS } from '../src/guard/tools.js';
 import { createScanner, findViolation, createScanTransform, FLOOR_LINE } from '../src/guard/scanner.js';
 import { dedupeAIStream, rewriteFrame, createFrameWatcher } from '../src/ai-stream-fix.js';
 
@@ -400,6 +400,94 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
       + `(at MIN_CORPUS) — all return ${minimal.length}`);
   }
 
+  // 5c-ter. Category must reach the model as the display word, never the
+  //     internal enum. Mapped in code because the model flattened every game
+  //     to "must watch" when asked to do the mapping itself, and because an
+  //     enum it never sees is an enum it cannot leak into prose.
+  {
+    const labels = new Set(Object.values(CATEGORY_LABEL));
+    const seen = new Set();
+    for (const g of searchGames(corpus, {}).games) {
+      seen.add(g.category);
+      if (!labels.has(g.category)) {
+        fail('oracle', `category "${g.category}" is not a display label`);
+      }
+    }
+    // Every recommendable class must have a label, or a game would surface
+    // with a raw enum the moment that class appears in the corpus.
+    for (const cls of RECOMMENDABLE_CLS) {
+      if (!CATEGORY_LABEL[cls]) fail('oracle', `no display label for class "${cls}"`);
+      const mapped = toResult({ ...corpus[0], cls }).category;
+      if (mapped !== CATEGORY_LABEL[cls]) {
+        fail('oracle', `class "${cls}" mapped to ${JSON.stringify(mapped)}`);
+      }
+    }
+    console.log(`  categories surface as display labels (${[...seen].join(', ')})`);
+  }
+
+  // 5c-quater. The first-turn line is composed in code, not by the model.
+  //     Three prompt attempts produced three different shapes, so the guard
+  //     now hands over a finished string.
+  {
+    for (const g of searchGames(corpus, {}).games) {
+      if (typeof g.line !== 'string' || !g.line.length) {
+        fail('oracle', `game ${g.id} has no preformatted line`);
+        continue;
+      }
+      if (!g.line.includes(g.category)) {
+        fail('oracle', `line omits the category: ${JSON.stringify(g.line)}`);
+      }
+      if (!g.line.startsWith(`${g.away} vs ${g.home}`)) {
+        fail('oracle', `line does not lead with the matchup: ${JSON.stringify(g.line)}`);
+      }
+      // The line must use one of the game's OWN phrases — not necessarily the
+      // top-weighted one. Choosing across the whole result set avoids five
+      // lines that all read "Down to the wire", but it must never invent or
+      // borrow a phrase from another game.
+      if (g.phrases.length && !g.phrases.some(p => g.line.includes(p))) {
+        fail('oracle', `line uses no phrase belonging to this game: ${JSON.stringify(g.line)}`);
+      }
+      // The line is shown to a user: it must obey invariant 1 like any other
+      // emitted text.
+      if (findViolation(g.line)) {
+        fail('oracle', `line contains a forbidden digit: ${JSON.stringify(g.line)}`);
+      }
+    }
+    // A game with no phrases still needs a usable line.
+    const bare = searchGames([{ ...corpus[0], phrases: '[]' }], {}).games[0];
+    if (!bare.line || !bare.line.includes(bare.category)) {
+      fail('oracle', `phraseless game produced no usable line: ${JSON.stringify(bare.line)}`);
+    }
+
+    // Phrase repetition across the list should be minimised — that is the
+    // whole reason choice happens at set level.
+    const lines = searchGames(corpus, {}).games.map(g => g.line);
+    const tails = lines.map(l => l.split('—')[1] ?? '');
+    const dupes = tails.length - new Set(tails).size;
+    if (dupes > 2) {
+      fail('oracle', `${dupes} duplicate phrase(s) across ${tails.length} lines — set-level choice is not working`);
+    }
+    // A game with nothing unique left must fall back to its OWN top phrase,
+    // never to a phrase another game used. Synthetic, because in the fixture
+    // the borrowed phrase happens to belong to the game anyway — so the
+    // fixture cannot distinguish the two behaviours.
+    {
+      const mk = (id, phrases) => ({
+        ...corpus[0], id, home: `H${id}`, away: `A${id}`,
+        ts: Date.now() - id * 1000, phrases: JSON.stringify(phrases),
+      });
+      const synth = [mk(1, ['Alpha']), mk(2, ['Beta']), mk(3, ['Beta'])];
+      for (const g of searchGames(synth, {}).games) {
+        const own = JSON.parse(synth.find(r => r.id === g.id).phrases);
+        if (!own.some(p => g.line.includes(p))) {
+          fail('oracle', `line borrowed a phrase this game does not have: ${JSON.stringify(g.line)}`);
+        }
+      }
+    }
+
+    console.log(`  first-turn lines composed in code, ${dupes} repeated phrase(s) across ${lines.length}`);
+  }
+
   // 5d. The return shape must have no field capable of expressing absence.
   //     Checked structurally rather than by inspection, so a field added later
   //     to be helpful trips this.
@@ -527,6 +615,11 @@ console.log('\n7. Output scanner (§8.1 layer 3)');
     // most two digits.
     'Totals:\n38 points on the night',
     'Totals:\n212. rushing yards',
+    // "rank" must not launder a digit elsewhere in the sentence.
+    'A ranked matchup that ended 21-20.',
+    'The 3rd-ranked team won by 7.',
+    // Rank is at most 3 digits. A longer run after "ranked" is not a rank.
+    'They were ranked 2120 in total yards.',
   ];
   const mustPass = [
     'A nail-biter between #12 Texas and Oklahoma.',
@@ -537,6 +630,12 @@ console.log('\n7. Output scanner (§8.1 layer 3)');
     'Down to the wire, and it went to overtime.',
     'Kickoff was 7:30 pm.',
     'A ranked matchup from the 2026 season.',
+    // Ranks in prose. The safe view carries home_rank/away_rank and §4.1
+    // permits ranks, but the model writes "ranked 7", not "#7". Found live:
+    // this blocked a correct answer mid-sentence.
+    'It was a ranked matchup, with the Longhorns ranked 7.',
+    'The 3rd-ranked Buckeyes were involved.',
+    'Ranked 12 against ranking 4.',
     // Enumerators. The model reaches for a numbered list whenever it offers
     // more than one game; without these the scanner aborted most useful
     // responses. Found live, not by review.
@@ -661,6 +760,10 @@ console.log('\n8. Scan transform (stream wiring)');
     if (!r.violations.length) fail('transform', 'violation not reported');
     if (/\d/.test(r.text)) fail('transform', `emitted digits: ${JSON.stringify(r.text)}`);
     if (!r.text.includes(FLOOR_LINE)) fail('transform', 'floor line not emitted');
+    // The cut sentence and the floor line must not run together.
+    if (!r.text.includes(`\n\n${FLOOR_LINE}`)) {
+      fail('transform', `floor line not separated from the truncated sentence: ${JSON.stringify(r.text.slice(-70))}`);
+    }
     if (!r.stopped) fail('transform', 'stopStream not called on violation');
     if (r.violations.length && !/\d/.test(r.text) && r.stopped) {
       console.log(`  violation: stopped, no digits emitted, floor line sent`);

@@ -10,6 +10,7 @@
 
 import { z } from 'zod';
 import { TAG_VOCAB } from './tags.js';
+export { RECOMMENDABLE_CLS } from './redaction.js';
 
 const RESULT_LIMIT = 5;
 
@@ -83,8 +84,28 @@ export const TOOL_DESCRIPTIONS = {
 // a filter was widened. It sees only games and their tags, and describes what
 // it actually has in front of it.
 
+/**
+ * Display labels for the disclosure category, matching the wording on
+ * spoilerfreescores.com.
+ *
+ * Mapped here rather than explained in the system prompt: the model was
+ * flattening every game to "must watch", which makes the label carry no
+ * information. The tool now hands it the finished word, so there is nothing
+ * to get wrong — and it never sees the internal enum, so it cannot leak it
+ * into prose either.
+ */
+export const CATEGORY_LABEL = {
+  watchworthy: 'must watch',
+  scorefest: 'scorefest',
+  watchable: 'watchable',
+};
+
 export function toResult(row) {
+  const phrases = JSON.parse(row.phrases);
+  const category = CATEGORY_LABEL[row.cls] ?? row.cls;
+
   return {
+
     id: row.id,
     home: row.home,
     away: row.away,
@@ -92,14 +113,14 @@ export function toResult(row) {
     date: row.date,
     home_rank: row.home_rank ?? undefined,
     away_rank: row.away_rank ?? undefined,
-    category: row.cls,
+    category,
     qualities: {
       competitiveness: row.competitiveness,
       scoring: row.scoring,
       overtime: !!row.overtime,
       ranked: row.ranked,
     },
-    phrases: JSON.parse(row.phrases),
+    phrases,
   };
 }
 
@@ -159,7 +180,27 @@ export function searchGames(rows, args = {}) {
   scored.sort((a, b) =>
     b.score - a.score || b.tier - a.tier || b.row.ts - a.row.ts);
 
-  return { games: scored.slice(0, RESULT_LIMIT).map(s => toResult(s.row)) };
+  const games = scored.slice(0, RESULT_LIMIT).map(s => toResult(s.row));
+
+  // Preformatted first-turn line. Composed here because three attempts at
+  // instructing the model to build it produced three different shapes — it
+  // dropped the category, moved the date inline, added preambles.
+  //
+  // Phrase choice is made across the WHOLE result set, not per game: taking
+  // each game's highest-weighted phrase gave five lines that read
+  // "Down to the wire" four times, because that is the top factor for every
+  // nail-biter. The list needs the phrase that DISTINGUISHES a game, not the
+  // one that scores highest. Falls back to the top phrase when a game has
+  // nothing unique left to say — which is honest: it really is the same story.
+  const used = new Set();
+  for (const g of games) {
+    const distinct = g.phrases.find(p => !used.has(p));
+    const phrase = distinct ?? g.phrases[0];
+    if (phrase) used.add(phrase);
+    g.line = `${g.away} vs ${g.home} — ${g.category}.` + (phrase ? ` ${phrase}.` : '');
+  }
+
+  return { games };
 }
 
 // ── Tool input repair ────────────────────────────────────────────────────────

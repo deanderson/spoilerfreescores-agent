@@ -18,6 +18,12 @@
 const PERMITTED = [
   /#\d{1,3}\b/g,                                            // #12 — poll rank
   /\bNo\.\s?\d{1,3}\b/gi,                                   // No. 12
+  // Rank stated in prose. The safe view carries home_rank/away_rank and §4.1
+  // permits ranks, but the model writes them as words ("ranked 7", "the
+  // 3rd-ranked Buckeyes") rather than "#7", and those were being blocked.
+  // Narrow on purpose: a score never follows the word "rank".
+  /\brank(?:ed|ing)?\s*#?\s*\d{1,3}(?:st|nd|rd|th)?\b/gi,
+  /\b\d{1,3}(?:st|nd|rd|th)?[- ]ranked\b/gi,
   /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}\b/gi,
   /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g,                    // 9/12
   /\b(?:20)\d{2}\b/g,                                       // year
@@ -150,7 +156,10 @@ export function createScanTransform({ stopStream, onViolation, onEmit, onContext
   const trip = (controller, id, violation) => {
     fired = true;
     onViolation?.(violation);
-    controller.enqueue({ type: 'text-delta', id, text: ` ${FLOOR_LINE}` });
+    // Paragraph break, not a space: the sentence in flight was cut mid-clause,
+    // so running the floor line straight on produced
+    // "...with the Longhorns ranked That's as much as I can give you".
+    controller.enqueue({ type: 'text-delta', id, text: `\n\n${FLOOR_LINE}` });
     controller.enqueue({ type: 'text-end', id });
     stopStream?.();
   };
