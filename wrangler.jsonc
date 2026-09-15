@@ -20,7 +20,6 @@
 		"run_worker_first": [
 			"/agents/*",
 			"/oauth/*",
-			"/debug/*"
 		]
 	},
 	"durable_objects": {

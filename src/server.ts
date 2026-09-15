@@ -7,6 +7,7 @@ import type { TextStreamPart, ToolSet } from "ai";
 import { createScanTransform } from "./guard/scanner.js";
 import { dedupeAIStream, createFrameWatcher } from "./ai-stream-fix.js";
 import {
+  repairToolInput,
   searchGamesInput,
   watchOptionsInput,
   savePreferenceInput,
@@ -36,12 +37,10 @@ type Prefs = Record<string, { value: string; liked: boolean }>;
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
 
-  // Disabled while diagnosing intermittent "The tool call was interrupted
-  // before a result was recorded" errors. Three error cards can appear
-  // alongside a single execute() run, and nothing surfaces through onError —
-  // consistent with the stream being interrupted and resumed, which is exactly
-  // what chatRecovery does. Re-enable if it proves unrelated.
-  chatRecovery = false;
+  // Resumes an interrupted stream after a disconnect. Was briefly disabled
+  // while chasing "tool call was interrupted" errors; those turned out to be
+  // the frame duplication, so this is back on.
+  chatRecovery = true;
 
   // MCP is removed, not disabled. An MCP server is an uncontrolled tool
   // surface: it can return arbitrary content straight into the model's
@@ -163,7 +162,6 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
                 `SELECT * FROM games WHERE sport = ?`
               ).bind(SPORT).all();
 
-              console.log(`[search_games] rows=${results?.length ?? 'none'} args=${JSON.stringify(args)}`);
               return searchGames(results as any[], args);
             } catch (err) {
               // The SDK reports execute failures to the model as a generic
@@ -223,34 +221,33 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
         createScanTransform({
           stopStream,
           onViolation: (v) => console.warn(`[scanner] blocked hallucinated number: ${v}`),
-          // A bare violation string has not been enough to diagnose the false
-          // positives. This prints what the scanner actually had in hand.
-          onContext: (c) => console.warn(
-            `[scanner] ctx where=${c.where} settledEnd=${c.settledEnd} fullLen=${c.fullLen}\n` +
-            `  full=${JSON.stringify(c.full)}\n` +
-            `  mask=${JSON.stringify(c.masked)}`,
-          ),
-          // TEMPORARY — diagnosing duplicated output. Logged once per fragment
-          // the server actually emits, so the tail distinguishes a doubled
-          // server stream from a client rendering it twice. Remove once the
-          // duplication is understood.
-          onEmit: (t) => console.log(`[emit] ${JSON.stringify(t)}`),
         }) as unknown as TransformStream<TextStreamPart<ToolSet>, TextStreamPart<ToolSet>>,
 
-      // Fires when a tool call cannot be validated — which is where the
-      // fragmented-arguments failure lands. Logs what the SDK actually
-      // assembled from the streamed fragments, and why it was rejected.
-      // Returning null declines the repair, so behaviour is unchanged; this is
-      // purely an instrument for now.
+      // A rejected tool call is otherwise invisible: the model sees a generic
+      // error card and execute() never runs, so neither a try/catch in the tool
+      // nor onError sees it. Returning null declines to repair — this only
+      // makes the failure legible.
       experimental_repairToolCall: async ({ toolCall, error }) => {
+        const call = toolCall as any;
+        const schema =
+          call?.toolName === 'search_games' ? searchGamesInput :
+          call?.toolName === 'save_preference' ? savePreferenceInput :
+          call?.toolName === 'get_watch_options' ? watchOptionsInput : null;
+
+        const repaired = schema ? repairToolInput(schema, call?.input) : null;
+
         console.error('[repair] tool call rejected', {
-          toolName: (toolCall as any)?.toolName,
-          input: (toolCall as any)?.input,
-          inputType: typeof (toolCall as any)?.input,
+          toolName: call?.toolName,
+          input: call?.input,
+          repaired: repaired ? JSON.stringify(repaired) : null,
           errorName: (error as any)?.name,
-          errorMessage: (error as any)?.message,
         });
-        return null;
+
+        // Repairs are type-only (see repairToolInput). An out-of-vocabulary
+        // enum is NOT repaired — it stays rejected, because accepting it would
+        // mean the schema no longer closes the vocabulary.
+        if (!repaired) return null;
+        return { ...call, input: JSON.stringify(repaired) };
       },
 
       // Errors above execute() — invalid tool input, unknown tool, provider
@@ -277,37 +274,6 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
 
 export default {
   async fetch(request: Request, env: Env) {
-    const url = new URL(request.url);
-
-    // TEMPORARY diagnostic route. Calls the AI binding directly — no
-    // workers-ai-provider, no AI SDK, no transform — and returns the raw SSE
-    // bytes. This is the only way to see what the model actually sends, since
-    // provider 3.3.1 emits no raw chunks for includeRawChunks to surface.
-    //
-    // If the SSE frames below are already duplicated, the duplication is in
-    // the model or the binding and no provider upgrade will fix it. If they
-    // are clean, it is workers-ai-provider assembling the stream wrong.
-    //
-    // REMOVE BEFORE ANY REAL USE: unauthenticated, on a public URL, and it
-    // spends Neurons on every request.
-    if (url.pathname === "/debug/raw") {
-      const stream = (await env.AI.run(
-        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-        {
-          messages: [
-            { role: "user", content: "Say exactly: Here are some games worth watching." },
-          ],
-          stream: true,
-          max_tokens: 40,
-        } as any,
-      )) as unknown as ReadableStream;
-
-      const raw = await new Response(stream).text();
-      return new Response(raw, {
-        headers: { "content-type": "text/plain; charset=utf-8" },
-      });
-    }
-
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
