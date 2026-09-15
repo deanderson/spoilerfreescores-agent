@@ -21,6 +21,7 @@ import {
 import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
 import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput } from '../src/guard/tools.js';
 import { createScanner, findViolation, createScanTransform, FLOOR_LINE } from '../src/guard/scanner.js';
+import { dedupeAIStream, rewriteFrame, createFrameWatcher } from '../src/ai-stream-fix.js';
 
 const [htmlPath, fixturePath] = process.argv.slice(2);
 if (!htmlPath || !fixturePath) {
@@ -515,6 +516,17 @@ console.log('\n7. Output scanner (§8.1 layer 3)');
     'It went to 2 overtimes.',
     'Rushing total was 212 yards.',
     'Score: 21-20',
+    // A list marker must not launder a digit elsewhere on the line.
+    '1. McNeese won 38-14',
+    'Here are picks:\n1. Texas by 3',
+    '2. The margin was 7',
+    // A mid-sentence "N. " must not read as a list marker — the enumerator
+    // pattern has to stay anchored to line start.
+    'They won by 3. It stayed close throughout.',
+    // Line-start digits only count as enumerators with a delimiter and at
+    // most two digits.
+    'Totals:\n38 points on the night',
+    'Totals:\n212. rushing yards',
   ];
   const mustPass = [
     'A nail-biter between #12 Texas and Oklahoma.',
@@ -525,6 +537,12 @@ console.log('\n7. Output scanner (§8.1 layer 3)');
     'Down to the wire, and it went to overtime.',
     'Kickoff was 7:30 pm.',
     'A ranked matchup from the 2026 season.',
+    // Enumerators. The model reaches for a numbered list whenever it offers
+    // more than one game; without these the scanner aborted most useful
+    // responses. Found live, not by review.
+    'Here are some games:\n1. McNeese vs Tarleton State\n2. Troy vs Sam Houston',
+    '1. First game\n2) Second game',
+    'A few picks: (1) McNeese, (2) Troy',
   ];
 
   let wrong = 0;
@@ -675,6 +693,141 @@ console.log('\n8. Scan transform (stream wiring)');
     ]);
     if (!r.out.some(p => p.type === 'tool-input-start')) fail('transform', 'tool part dropped');
     else console.log('  non-text parts pass through');
+  }
+}
+
+// ── Test 9: AI stream dedupe ─────────────────────────────────────────────────
+// The Workers AI binding sends each fragment twice per SSE frame. Frame shapes
+// below are copied from a live /debug/raw capture, not invented.
+
+console.log('\n9. Workers AI stream dedupe');
+{
+  const FRAMES = [
+    'data: {"choices":[{"delta":{"content":"","role":"assistant"}}],"response":"","usage":{"prompt_tokens":45}}',
+    'data: {"choices":[{"delta":{"content":"Here"}}],"response":"Here","tool_calls":[]}',
+    'data: {"choices":[{"delta":{"content":" are some games"}}],"response":" are some games"}',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"tool_calls":[]}',
+    'data: {"response":"","usage":{"completion_tokens":8}}',
+    'data: [DONE]',
+  ].join('\n\n');
+
+  async function run(chunkSize) {
+    const enc = new TextEncoder();
+    const chunks = [];
+    for (let i = 0; i < FRAMES.length; i += chunkSize) {
+      chunks.push(enc.encode(FRAMES.slice(i, i + chunkSize)));
+    }
+    const src = new ReadableStream({
+      start(c) { chunks.forEach(x => c.enqueue(x)); c.close(); },
+    });
+    return await new Response(dedupeAIStream(src)).text();
+  }
+
+  // Frame reassembly must survive arbitrary chunk boundaries — the duplicate
+  // field can straddle two network chunks.
+  for (const size of [7, 37, 200, 5000]) {
+    const out = await run(size);
+    let text = '', stillDuplicated = 0, done = false;
+    for (const f of out.split('\n\n')) {
+      if (!f.startsWith('data: ')) continue;
+      const p = f.slice(6).trim();
+      if (p === '[DONE]') { done = true; continue; }
+      let o;
+      try { o = JSON.parse(p); } catch { fail('dedupe', `chunk ${size}: emitted invalid JSON: ${p.slice(0,60)}`); continue; }
+      const d = o?.choices?.[0]?.delta?.content;
+      if (typeof d === 'string' && typeof o.response === 'string') stillDuplicated++;
+      if (d) text += d;
+    }
+    if (stillDuplicated) fail('dedupe', `chunk ${size}: ${stillDuplicated} frame(s) still carry both fields`);
+    if (text !== 'Here are some games') fail('dedupe', `chunk ${size}: text is ${JSON.stringify(text)}`);
+    if (!done) fail('dedupe', `chunk ${size}: [DONE] frame lost`);
+  }
+  console.log('  4 chunk sizes — duplicate field removed, text intact, [DONE] preserved');
+
+  // The usage-only tail frame has no delta; it must not be altered.
+  const tail = 'data: {"response":"","usage":{"completion_tokens":8}}';
+  if (rewriteFrame(tail) !== tail) fail('dedupe', 'usage-only tail frame was modified');
+
+  // Non-JSON and comment frames pass through untouched.
+  for (const f of ['data: [DONE]', ': keep-alive', 'data: not json at all']) {
+    if (rewriteFrame(f) !== f) fail('dedupe', `frame altered when it should not be: ${f}`);
+  }
+  console.log('  tail, [DONE], keep-alive and non-JSON frames untouched');
+
+  // Numeric carriers. A token that is entirely digits can arrive as a JSON
+  // number rather than a string. A typeof === 'string' test skips those, the
+  // provider coerces them back to text, and the fragment is emitted twice —
+  // which is why words stopped doubling but "Sep 12" became "Sep 1212".
+  {
+    const numResp = 'data: ' + JSON.stringify({ choices: [{ delta: { content: '12' } }], response: 12 });
+    const o1 = JSON.parse(rewriteFrame(numResp).slice(6));
+    if ('response' in o1) fail('dedupe', 'numeric response not stripped');
+
+    const numBoth = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 12 } }], response: 12 });
+    const o2 = JSON.parse(rewriteFrame(numBoth).slice(6));
+    if ('response' in o2) fail('dedupe', 'numeric response not stripped when delta is numeric too');
+    if (o2?.choices?.[0]?.delta?.content !== 12) fail('dedupe', 'numeric delta lost');
+
+    // Still must not strip when only one carrier is present.
+    const respOnlyNum = 'data: ' + JSON.stringify({ response: 12 });
+    if (rewriteFrame(respOnlyNum) !== respOnlyNum) fail('dedupe', 'single numeric carrier was modified');
+
+    // Booleans and objects are not text and must not be treated as carriers.
+    const boolResp = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'x' } }], response: true });
+    if (rewriteFrame(boolResp) !== boolResp) fail('dedupe', 'non-textual response was stripped');
+
+    console.log('  numeric carriers stripped, single-carrier and non-textual frames untouched');
+  }
+
+  // Tool-call duplication. Same root cause as the text doubling, but the
+  // consequence is worse: fragments interleave into unparseable JSON and the
+  // model retries to the step limit. Shapes from a live capture.
+  {
+    const frag = '{"recency": "';
+    const both = 'data: ' + JSON.stringify({
+      choices: [{ delta: { tool_calls: [{ function: { arguments: frag } }] } }],
+      tool_calls: [{ arguments: frag }],
+    });
+    const out = JSON.parse(rewriteFrame(both).slice(6));
+    if ('tool_calls' in out) fail('dedupe', 'duplicate top-level tool_calls not stripped');
+    if (!out?.choices?.[0]?.delta?.tool_calls?.length) fail('dedupe', 'delta tool_calls lost');
+
+    // A frame using only one carrier must be left alone — stripping it would
+    // drop the tool call entirely.
+    const topOnly = 'data: ' + JSON.stringify({ tool_calls: [{ arguments: frag }] });
+    if (rewriteFrame(topOnly) !== topOnly) fail('dedupe', 'single-carrier tool_calls frame was modified');
+
+    const deltaOnly = 'data: ' + JSON.stringify({
+      choices: [{ delta: { tool_calls: [{ function: { arguments: frag } }] } }],
+    });
+    if (rewriteFrame(deltaOnly) !== deltaOnly) fail('dedupe', 'delta-only tool_calls frame was modified');
+
+    console.log('  duplicate tool_calls stripped, single-carrier frames untouched');
+  }
+
+  // Frame watcher: the point is distinguishing a complete stream from one that
+  // ended early, which is the open question on the interrupted tool calls.
+  {
+    const lines = [];
+    const enc = new TextEncoder();
+    const mk = (t) => new ReadableStream({ start(c) { c.enqueue(enc.encode(t)); c.close(); } });
+
+    await new Response(dedupeAIStream(mk(FRAMES), createFrameWatcher(l => lines.push(l)))).text();
+    const complete = lines.find(l => l.includes('END'));
+    if (!complete || complete.includes('ENDED EARLY')) {
+      fail('dedupe', `complete stream reported as truncated: ${complete}`);
+    }
+
+    const cut = [];
+    const truncated = FRAMES.split('\n\n').slice(0, 2).join('\n\n');
+    await new Response(dedupeAIStream(mk(truncated), createFrameWatcher(l => cut.push(l)))).text();
+    const early = cut.find(l => l.includes('END'));
+    if (!early || !early.includes('ENDED EARLY')) {
+      fail('dedupe', `truncated stream not flagged: ${early}`);
+    }
+    if (complete && !complete.includes('ENDED EARLY') && early?.includes('ENDED EARLY')) {
+      console.log('  frame watcher distinguishes complete from truncated streams');
+    }
   }
 }
 
