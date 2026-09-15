@@ -61,7 +61,12 @@ export const TOOL_DESCRIPTIONS = {
   search_games:
     'Find completed games worth watching. Returns games with their qualities. '
     + 'Each returned game carries its own tags — read them to describe what you '
-    + 'are offering. There is no count and no total; do not infer one.',
+    + 'are offering. There is no count and no total; do not infer one. '
+    + 'Pass ONLY what the user actually asked for. Do not invent teams, '
+    + 'leagues, or preferences they did not mention — call with no arguments '
+    + 'if they gave no constraints. Every argument is a hint for ranking, not '
+    + 'a filter, so guessing does not narrow anything; it just reorders results '
+    + 'around something the user never said.',
   get_watch_options:
     'Where and how to watch a specific game, plus an estimated runtime. '
     + 'Does not return anything about what happened in the game.',

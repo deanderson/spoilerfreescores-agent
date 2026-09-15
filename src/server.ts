@@ -5,6 +5,7 @@ import { convertToModelMessages, pruneMessages, stepCountIs, streamText, tool } 
 import type { TextStreamPart, ToolSet } from "ai";
 
 import { createScanTransform } from "./guard/scanner.js";
+import { dedupeAIStream, createFrameWatcher } from "./ai-stream-fix.js";
 import {
   searchGamesInput,
   watchOptionsInput,
@@ -14,6 +15,9 @@ import {
   toResult,
 } from "./guard/tools.js";
 
+// Re-exported so the Workflow class resolves from the Worker entry point.
+// Without this, `wrangler deploy` fails with a class-not-found error that
+// reads like a Workflows problem rather than a missing export.
 export { IngestWorkflow } from "./ingest.js";
 
 const SPORT = "ncaaf";
@@ -31,7 +35,13 @@ type Prefs = Record<string, { value: string; liked: boolean }>;
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
-  chatRecovery = true;
+
+  // Disabled while diagnosing intermittent "The tool call was interrupted
+  // before a result was recorded" errors. Three error cards can appear
+  // alongside a single execute() run, and nothing surfaces through onError —
+  // consistent with the stream being interrupted and resumed, which is exactly
+  // what chatRecovery does. Re-enable if it proves unrelated.
+  chatRecovery = false;
 
   // MCP is removed, not disabled. An MCP server is an uncontrolled tool
   // surface: it can return arbitrary content straight into the model's
@@ -43,10 +53,38 @@ export class ChatAgent extends AIChatAgent<Env> {
   }
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
+    // The Workers AI binding sends each fragment twice per SSE frame — once in
+    // choices[].delta.content and once in the legacy `response` field — and
+    // provider 3.3.1 emits a text-delta for both. Strip the duplicate before
+    // the provider parses it. See src/ai-stream-fix.js.
+    const env = this.env;
+    const ai = new Proxy(this.env.AI, {
+      get(target, prop, receiver) {
+        if (prop !== "run") return Reflect.get(target, prop, receiver);
+        return async (model: string, inputs: any, options?: any) => {
+          const result = await (target as any).run(model, inputs, options);
+          if (!(inputs?.stream && result instanceof ReadableStream)) return result;
+
+          // Frame watching is gated on a var so it can be turned on against a
+          // live turn without a code change. It reports structure only —
+          // tool calls, finish reasons, and whether the stream ended early.
+          const watch = (env as any)?.DEBUG_FRAMES === "1"
+            ? createFrameWatcher()
+            : undefined;
+          return dedupeAIStream(result, watch);
+        };
+      },
+    });
+
     const workersai = createWorkersAI({
-      binding: this.env.AI,
+      binding: ai,
       gateway: { id: "sfs-agent" },
     });
+
+    // One tool failure should end the turn. Without this the model retries up
+    // to the step limit, producing a wall of identical error cards and burning
+    // Neurons on a call that cannot succeed.
+    let toolFailed = false;
 
     const prefs = await this.loadPrefs();
     const prefLines = Object.entries(prefs)
@@ -54,11 +92,21 @@ export class ChatAgent extends AIChatAgent<Env> {
       .join("\n");
 
     const result = streamText({
-      model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-        sessionAffinity: this.sessionAffinity,
-      }),
+      // sessionAffinity removed while diagnosing duplicated stream output.
+      // [emit] logging proved the doubling arrives at the transform already
+      // doubled, so it originates in the provider or the model call, not in
+      // the guard. This is the least-standard option in the call.
+      model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
 
       system: `You recommend college football games worth watching, without spoiling them.
+
+Every game you can see has ALREADY BEEN PLAYED and is final. You are helping
+someone decide what to go back and watch, not previewing anything upcoming.
+Write in the past tense: "was a nail-biter", "went to overtime". Never write
+that a game "is expected to be" anything — nothing here is expected, it is
+finished. Each game comes with the date it was played; say the date when you
+offer it, and if the user asks about a particular day, tell them which day the
+games you have actually come from.
 
 You never learn the score of any game. You genuinely do not have it — the data
 you can reach has been stripped of scores, margins, and totals before it gets to
@@ -86,6 +134,11 @@ Typical runtime for these games is ${RUNTIME_ESTIMATE}.
 
 ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
 
+      // Responses were hitting finish_reason=length and cutting off mid
+      // sentence. Five games with a line each needs room; the floor line at the
+      // end of the disclosure ladder needs to survive too.
+      maxOutputTokens: 800,
+
       // Tool-call pruning is OFF for recall. The disclosure ladder (§5) assumes
       // the model still has the safe view it was handed earlier in the session;
       // prune it and the model either re-calls or invents. Reasoning pruning is
@@ -100,15 +153,31 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
           description: TOOL_DESCRIPTIONS.search_games,
           inputSchema: searchGamesInput,
           execute: async (args) => {
-            // Read the whole corpus and rank in memory. The corpus is bounded
-            // by retention (~45-200 rows), and ranking in SQL would mean
-            // building a WHERE clause — which is exactly the thing that turns
-            // this tool into an oracle.
-            const { results } = await this.env.DB.prepare(
-              `SELECT * FROM games WHERE sport = ?`
-            ).bind(SPORT).all();
+            if (toolFailed) return { games: [] };
+            try {
+              // Read the whole corpus and rank in memory. The corpus is bounded
+              // by retention (~45-200 rows), and ranking in SQL would mean
+              // building a WHERE clause — which is exactly the thing that turns
+              // this tool into an oracle.
+              const { results } = await this.env.DB.prepare(
+                `SELECT * FROM games WHERE sport = ?`
+              ).bind(SPORT).all();
 
-            return searchGames(results as any[], args);
+              console.log(`[search_games] rows=${results?.length ?? 'none'} args=${JSON.stringify(args)}`);
+              return searchGames(results as any[], args);
+            } catch (err) {
+              // The SDK reports execute failures to the model as a generic
+              // "An error occurred", so the real cause has to be logged here or
+              // it is invisible in wrangler tail.
+              toolFailed = true;
+              console.error('[search_games] FAILED', {
+                message: (err as Error)?.message,
+                stack: (err as Error)?.stack,
+                hasDB: !!this.env.DB,
+                args,
+              });
+              throw err;
+            }
           },
         }),
 
@@ -154,7 +223,49 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
         createScanTransform({
           stopStream,
           onViolation: (v) => console.warn(`[scanner] blocked hallucinated number: ${v}`),
+          // A bare violation string has not been enough to diagnose the false
+          // positives. This prints what the scanner actually had in hand.
+          onContext: (c) => console.warn(
+            `[scanner] ctx where=${c.where} settledEnd=${c.settledEnd} fullLen=${c.fullLen}\n` +
+            `  full=${JSON.stringify(c.full)}\n` +
+            `  mask=${JSON.stringify(c.masked)}`,
+          ),
+          // TEMPORARY — diagnosing duplicated output. Logged once per fragment
+          // the server actually emits, so the tail distinguishes a doubled
+          // server stream from a client rendering it twice. Remove once the
+          // duplication is understood.
+          onEmit: (t) => console.log(`[emit] ${JSON.stringify(t)}`),
         }) as unknown as TransformStream<TextStreamPart<ToolSet>, TextStreamPart<ToolSet>>,
+
+      // Fires when a tool call cannot be validated — which is where the
+      // fragmented-arguments failure lands. Logs what the SDK actually
+      // assembled from the streamed fragments, and why it was rejected.
+      // Returning null declines the repair, so behaviour is unchanged; this is
+      // purely an instrument for now.
+      experimental_repairToolCall: async ({ toolCall, error }) => {
+        console.error('[repair] tool call rejected', {
+          toolName: (toolCall as any)?.toolName,
+          input: (toolCall as any)?.input,
+          inputType: typeof (toolCall as any)?.input,
+          errorName: (error as any)?.name,
+          errorMessage: (error as any)?.message,
+        });
+        return null;
+      },
+
+      // Errors above execute() — invalid tool input, unknown tool, provider
+      // failures — never reach the tool body, so a try/catch inside execute
+      // cannot see them. This is the only place they surface.
+      onError: ({ error }) => {
+        const e = error as any;
+        console.error('[streamText] ERROR', {
+          name: e?.name,
+          message: e?.message,
+          toolName: e?.toolName,
+          toolInput: e?.toolInput ?? e?.input,
+          cause: String(e?.cause ?? ''),
+        });
+      },
 
       stopWhen: stepCountIs(10),
       abortSignal: options?.abortSignal,
@@ -166,6 +277,37 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
 
 export default {
   async fetch(request: Request, env: Env) {
+    const url = new URL(request.url);
+
+    // TEMPORARY diagnostic route. Calls the AI binding directly — no
+    // workers-ai-provider, no AI SDK, no transform — and returns the raw SSE
+    // bytes. This is the only way to see what the model actually sends, since
+    // provider 3.3.1 emits no raw chunks for includeRawChunks to surface.
+    //
+    // If the SSE frames below are already duplicated, the duplication is in
+    // the model or the binding and no provider upgrade will fix it. If they
+    // are clean, it is workers-ai-provider assembling the stream wrong.
+    //
+    // REMOVE BEFORE ANY REAL USE: unauthenticated, on a public URL, and it
+    // spends Neurons on every request.
+    if (url.pathname === "/debug/raw") {
+      const stream = (await env.AI.run(
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        {
+          messages: [
+            { role: "user", content: "Say exactly: Here are some games worth watching." },
+          ],
+          stream: true,
+          max_tokens: 40,
+        } as any,
+      )) as unknown as ReadableStream;
+
+      const raw = await new Response(stream).text();
+      return new Response(raw, {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })

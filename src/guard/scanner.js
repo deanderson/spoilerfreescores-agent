@@ -23,6 +23,15 @@ const PERMITTED = [
   /\b(?:20)\d{2}\b/g,                                       // year
   /\b\d{1,2}(?:\.\d)?\s*(?:-|–|to)?\s*\d{0,2}(?:\.\d)?\s*(?:hours?|hrs?|h|minutes?|mins?)\b/gi,
   /\b\d{1,2}(?::\d{2})\s*(?:am|pm)?\b/gi,                   // clock time
+
+  // Enumerators. Not a digit describing play — a model recommending several
+  // games reaches for a numbered list constantly, and without this the scanner
+  // aborts most useful responses. Deliberately narrow: a small integer only at
+  // the start of a line followed by '. ' or ') ', or wrapped in parentheses.
+  // A score cannot occupy that position, and any digit elsewhere on the line
+  // is still judged normally.
+  /^[ \t]*\d{1,2}[.)](?=\s)/gm,                             // "1. " / "2) "
+  /\(\d{1,2}\)/g,                                           // "(1)"
 ];
 
 // Held back so a number split across deltas ("3" then "8") is never emitted
@@ -41,12 +50,17 @@ export const FLOOR_LINE =
  *              the settled boundary; everything after it may still grow.
  * @returns the offending fragment, or null when clean.
  */
-export function findViolation(text, limit = text.length) {
-  // Mask with same-length runs so offsets survive and `limit` stays meaningful.
+/** Replace every permitted pattern with same-length blanks, preserving offsets. */
+export function maskPermitted(text) {
   let masked = text;
   for (const re of PERMITTED) {
     masked = masked.replace(re, (m) => ' '.repeat(m.length));
   }
+  return masked;
+}
+
+export function findViolation(text, limit = text.length) {
+  const masked = maskPermitted(text);
   const m = /\d[\d,.]*/.exec(masked.slice(0, limit));
   return m ? text.slice(m.index, m.index + m[0].length) : null;
 }
@@ -77,7 +91,20 @@ export function createScanner() {
       const violation = findViolation(full, settledEnd);
       if (violation) {
         tripped = true;
-        return { emit: '', violation };
+        // The violation alone has never been enough to diagnose a false
+        // positive: what matters is the accumulated text, where the settled
+        // boundary sat, and what the mask left behind.
+        return {
+          emit: '',
+          violation,
+          context: {
+            where: 'push',
+            settledEnd,
+            fullLen: full.length,
+            full,
+            masked: maskPermitted(full),
+          },
+        };
       }
 
       const emit = full.slice(emitted, settledEnd);
@@ -90,7 +117,11 @@ export function createScanner() {
       const violation = findViolation(full);
       if (violation) {
         tripped = true;
-        return { emit: '', violation };
+        return {
+          emit: '',
+          violation,
+          context: { where: 'flush', settledEnd: full.length, fullLen: full.length, full, masked: maskPermitted(full) },
+        };
       }
       const emit = full.slice(emitted);
       emitted = full.length;
@@ -112,7 +143,7 @@ export function createScanner() {
  * stop generation. A scanner that flags without acting is theatre, and the
  * truncated generation is the evidence trail in AI Gateway.
  */
-export function createScanTransform({ stopStream, onViolation } = {}) {
+export function createScanTransform({ stopStream, onViolation, onEmit, onContext } = {}) {
   const scanners = new Map();
   let fired = false;
 
@@ -132,8 +163,15 @@ export function createScanTransform({ stopStream, onViolation } = {}) {
         let scanner = scanners.get(part.id);
         if (!scanner) { scanner = createScanner(); scanners.set(part.id, scanner); }
 
-        const { emit, violation } = scanner.push(part.text);
-        if (emit) controller.enqueue({ ...part, text: emit });
+        const { emit, violation, context } = scanner.push(part.text);
+        if (violation && context) onContext?.(context);
+        if (emit) {
+          onEmit?.(emit);
+          // Fresh part rather than { ...part }: the incoming part may carry a
+          // `delta` field alongside `text`, and spreading would keep the
+          // original chunk there while only `text` was scrubbed.
+          controller.enqueue({ type: 'text-delta', id: part.id, text: emit });
+        }
         if (violation) trip(controller, part.id, violation);
         return;
       }
@@ -141,8 +179,12 @@ export function createScanTransform({ stopStream, onViolation } = {}) {
       if (part.type === 'text-end') {
         const scanner = scanners.get(part.id);
         if (scanner) {
-          const { emit, violation } = scanner.flush();
-          if (emit) controller.enqueue({ type: 'text-delta', id: part.id, text: emit });
+          const { emit, violation, context } = scanner.flush();
+          if (violation && context) onContext?.(context);
+          if (emit) {
+            onEmit?.(emit);
+            controller.enqueue({ type: 'text-delta', id: part.id, text: emit });
+          }
           if (violation) return trip(controller, part.id, violation);
         }
       }
