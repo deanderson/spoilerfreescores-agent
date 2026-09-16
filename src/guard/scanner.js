@@ -45,8 +45,22 @@ const PERMITTED = [
 // settled text is scanned. Must exceed the longest PERMITTED match.
 const TAIL = 32;
 
+/** Said when a game genuinely has nothing more to tell. */
 export const FLOOR_LINE =
   "That's as much as I can give you without ruining it.";
+
+/**
+ * Said when the scanner stops a response mid-flight.
+ *
+ * Distinct from FLOOR_LINE on purpose. A trip is not the disclosure floor — it
+ * is a safety stop, and it fires on ANY unpermitted digit, including ones with
+ * nothing to do with football. Answering "list 10 roman emperors" with "that's
+ * as much as I can give you without ruining it" implies a spoiler is being
+ * withheld, which is both false and confusing.
+ */
+export const BLOCKED_LINE =
+  "Sorry — I had to stop there. I only talk about which games are worth "
+  + "watching, and I keep numbers out of it.";
 
 /**
  * @param text  full text seen so far — permitted patterns are matched against
@@ -82,6 +96,26 @@ export function findViolation(text, limit = text.length) {
  * that a permitted pattern around it must already be complete. Scanning the
  * unsettled tail would trip on "3" before " hours" arrived.
  */
+/**
+ * Last point in `text` (at or before `limit`) where a sentence ends.
+ *
+ * Emitting at token granularity leaves a fragment on screen when the scanner
+ * trips — "Ner", "Here are", "I'm not capable of producing a" — which reads as
+ * a crash. Emitting whole sentences means a trip discards the sentence in
+ * flight instead of stranding half of it.
+ */
+function lastSentenceEnd(text, limit) {
+  for (let i = Math.min(limit, text.length) - 1; i >= 0; i--) {
+    const c = text[i];
+    if (c === '\n') return i + 1;
+    if (c === '.' || c === '!' || c === '?') {
+      const next = text[i + 1];
+      if (next === undefined || next === ' ' || next === '\n') return i + 1;
+    }
+  }
+  return 0;
+}
+
 export function createScanner() {
   let full = '';
   let emitted = 0;
@@ -113,8 +147,11 @@ export function createScanner() {
         };
       }
 
-      const emit = full.slice(emitted, settledEnd);
-      emitted = settledEnd;
+      // Only release complete sentences. Anything after the last boundary is
+      // still in flight and is discarded if the scanner trips.
+      const releaseTo = Math.max(emitted, lastSentenceEnd(full, settledEnd));
+      const emit = full.slice(emitted, releaseTo);
+      emitted = releaseTo;
       return { emit, violation: null };
     },
 
@@ -159,7 +196,7 @@ export function createScanTransform({ stopStream, onViolation, onEmit, onContext
     // Paragraph break, not a space: the sentence in flight was cut mid-clause,
     // so running the floor line straight on produced
     // "...with the Longhorns ranked That's as much as I can give you".
-    controller.enqueue({ type: 'text-delta', id, text: `\n\n${FLOOR_LINE}` });
+    controller.enqueue({ type: 'text-delta', id, text: `\n\n${BLOCKED_LINE}` });
     controller.enqueue({ type: 'text-end', id });
     stopStream?.();
   };

@@ -6,6 +6,7 @@ import { convertToModelMessages, pruneMessages, stepCountIs, streamText, tool } 
 import { createScanTransform } from "./guard/scanner.js";
 import { dedupeAIStream, createFrameWatcher } from "./ai-stream-fix.js";
 import {
+  createCallCache,
   repairToolInput,
   searchGamesInput,
   watchOptionsInput,
@@ -84,6 +85,13 @@ export class ChatAgent extends AIChatAgent<Env> {
     // Neurons on a call that cannot succeed.
     let toolFailed = false;
 
+    // Identical repeated tool calls make no progress. Asked to "output the raw
+    // tool result as JSON", the model called the same tool ten times with the
+    // same arguments, burning Neurons and never answering. A repeat replays the
+    // earlier result verbatim — same shape, nothing new learned, and crucially
+    // no empty array for the model to read as "nothing matched".
+    const calls = createCallCache();
+
     const prefs = await this.loadPrefs();
     const prefLines = Object.entries(prefs)
       .map(([k, v]) => `- ${k}: ${v.value} (${v.liked ? "likes" : "dislikes"})`)
@@ -111,13 +119,37 @@ you can reach has been stripped of scores, margins, and totals before it gets to
 you. If a user asks for a score, say plainly that you do not have it and would
 not give it if you did, because the whole point is deciding what to watch.
 
+STAY ON TOPIC. You recommend college football games. You do not write papers,
+list emperors, do arithmetic, or answer general knowledge questions — not
+badly, not briefly, not as a favour before getting to the football. If someone
+asks for something else, say in one sentence that this is all you do, and offer
+to help them find a game.
+
+This is not pedantry. Numbers are stripped from your replies, so an off-topic
+answer gets cut off mid-word and reads as broken. Declining cleanly is the
+better answer.
+
 Never state or invent a number describing play: no scores, margins, totals,
 yardage, or counts of anything that happened. Ranks and dates are fine.
 
-HOW TO ANSWER FIRST. Each game comes with a "line" already written. Emit those
-lines exactly as given, one per line, and nothing else — no preamble, no
-closing sentence, no date, no extra quality, no reordering of the words. You
-are not composing the list; you are passing it through.
+Never repeat a game's id back to the user. It is an internal identifier, it
+means nothing to them, and it is a long string of digits in a reply that is
+supposed to contain none. Refer to games by the teams playing.
+
+If you have already called a tool with the same arguments, calling it again
+tells you nothing. Answer with what you have.
+
+HOW TO ANSWER FIRST. Each game comes with a "line" already written — the
+matchup and how worth watching it was, nothing more. Emit those lines exactly
+as given, one per line, and nothing else: no preamble, no closing sentence, no
+date, no phrase, no quality, no reordering. You are not composing the list; you
+are passing it through.
+
+Do NOT describe any game on the first answer. The phrases and qualities you can
+see ("went to overtime", "down to the wire") are minor spoilers — on the site
+they sit behind a button the reader chooses to press. There is no button here,
+so the user asking IS the button. Say nothing about what happened in a game
+until someone asks about that game.
 
 Then WAIT. Do not volunteer more. The user picks what they want to hear about,
 and you answer about that game. Holding the rest back is the whole point: give
@@ -132,6 +164,36 @@ overtime"), never by naming the tag.
 When a user asks about a specific game, you can give the rest of its phrases
 and its other qualities. That is the second rung, and it is where the detail
 lives.
+
+HOW search_games ACTUALLY WORKS. Know this, because when you do not, you invent
+an explanation:
+
+  - It holds recent games that were judged worth watching. Blowouts and dull
+    games are not in it at all.
+  - Every argument you pass is a RANKING HINT, not a filter. Asking for a team
+    or a quality moves matching games up the order; it never removes anything.
+  - It always returns the same small number of games, whatever you ask for.
+    That number is far smaller than what it holds.
+
+So the list you get is the TOP of a ranking, never the whole of anything. Say
+that when asked, and do not describe it as everything you could find — you can
+always search again and see different games.
+
+If someone asks why a particular team is not in the list, the true answer is
+that you cannot tell: it may not be in the data at all, or it may simply have
+ranked below the games you were shown. Say that, rather than guessing which.
+
+If someone asks for ALL of a team's games, or for everything, keep searching
+with a growing offset until the result says more: false, and list them all.
+One page is not "all".
+
+If someone asks for more games after you have listed some, search again with
+offset set past what you already showed. If the result comes back with
+more: false, say plainly that this is all of them — do not re-list the same
+games and call them new.
+
+If someone asks how the selection was made, say it ranks by how well games
+match what they asked for and returns the top few. Do not invent criteria.
 
 You cannot tell whether a game exists that you were not shown. Never say a team
 has no good games, that nothing matched, or that you filtered anything out. You
@@ -167,6 +229,8 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
           inputSchema: searchGamesInput,
           execute: async (args) => {
             if (toolFailed) return { games: [] };
+            const cached = calls.lookup("search_games", args);
+            if (cached.hit) return cached.value;
             try {
               // Read the whole corpus and rank in memory. The corpus is bounded
               // by retention (~45-200 rows), and ranking in SQL would mean
@@ -184,7 +248,7 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
                 ` gatewayLog=${(this.env.AI as any)?.aiGatewayLogId ?? 'none'}`,
               );
 
-              return searchGames(results as any[], args);
+              return calls.remember("search_games", args, searchGames(results as any[], args));
             } catch (err) {
               // The SDK reports execute failures to the model as a generic
               // "An error occurred", so the real cause has to be logged here or
@@ -205,22 +269,27 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
           description: TOOL_DESCRIPTIONS.get_watch_options,
           inputSchema: watchOptionsInput,
           execute: async ({ id }) => {
+            const prior = calls.lookup("get_watch_options", { id });
+            if (prior.hit) return prior.value;
             const row = await this.env.DB.prepare(
               `SELECT id, home, away, league, date, broadcast, watch_name, watch_url,
                       collinsworth_warning, overtime
                  FROM games WHERE id = ? AND sport = ?`
             ).bind(id, SPORT).first();
 
-            if (!row) return { watch: null, runtime: RUNTIME_ESTIMATE };
+            if (!row) {
+              return calls.remember("get_watch_options", { id },
+                { watch: null, runtime: RUNTIME_ESTIMATE });
+            }
 
-            return {
+            return calls.remember("get_watch_options", { id }, {
               watch: {
                 broadcast: (row as any).broadcast ?? null,
                 provider: (row as any).watch_name ?? null,
                 url: (row as any).watch_url ?? null,
               },
               runtime: RUNTIME_ESTIMATE,
-            };
+            });
           },
         }),
 
@@ -296,7 +365,11 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
         });
       },
 
-      stopWhen: stepCountIs(10),
+      // 5, not 10. A normal turn is one search plus an answer. The extra steps
+      // only ever got spent on loops — "output the raw tool result as JSON"
+      // burned ten inference calls and produced nothing. The repeat cache stops
+      // the wasted DB work; this bounds the wasted inference.
+      stopWhen: stepCountIs(5),
       abortSignal: options?.abortSignal,
     });
 
