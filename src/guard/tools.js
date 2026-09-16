@@ -56,6 +56,10 @@ export const watchOptionsInput = z.object({
   id: z.string(),
 }).strict();
 
+export const gameDetailInput = z.object({
+  id: z.string(),
+}).strict();
+
 export const savePreferenceInput = z.object({
   // Closed key vocabulary. Free-text keys let the model record dimensions the
   // filter cannot act on, so the §7 durable/per-query split fails silently.
@@ -67,8 +71,14 @@ export const savePreferenceInput = z.object({
 export const TOOL_DESCRIPTIONS = {
   search_games:
     'Find completed games worth watching. Returns games with their qualities. '
-    + 'Each returned game carries its own tags — read them to describe what you '
-    + 'are offering. There is no count and no total; do not infer one. '
+    + 'The result includes a ready-made "list" — the games as a markdown list, '
+    + 'one per line. Emit that verbatim. Do not rebuild it from the games '
+    + 'array, do not join the lines into a paragraph. '
+    + 'There is no count and no total; do not infer one. '
+    + 'If the result has an unmatched list, those names did not match any team '
+    + 'that played. Say you do not recognise the name and ask which team they '
+    + 'meant — do not page for more, and do not present the games you got back '
+    + 'as that team\'s games. '
     + 'If the result says more: true, there are further games for that team — '
     + 'call again with offset set past what you have already seen (offset 5, '
     + 'then 10) to get them. Never present the same games twice as if they were '
@@ -82,6 +92,11 @@ export const TOOL_DESCRIPTIONS = {
     + 'if they gave no constraints. Every argument is a hint for ranking, not '
     + 'a filter, so guessing does not narrow anything; it just reorders results '
     + 'around something the user never said.',
+  get_game_detail:
+    'What a game was like — the colour commentary. Call this only when the user '
+    + 'asks about a specific game. On the site this sits behind a Why Watch '
+    + 'button the reader chooses to press; here, their asking is the button. '
+    + 'Never call it for every game in a list.',
   get_watch_options:
     'Where and how to watch a specific game, plus an estimated runtime. '
     + 'Does not return anything about what happened in the game.',
@@ -119,9 +134,23 @@ export const CATEGORY_LABEL = {
   blowout: 'skip',
 };
 
+/**
+ * Display label for a class, falling back to the raw value.
+ *
+ * A function rather than an index expression because callers read `cls` off a
+ * D1 row, where it is untyped — indexing the map directly means a cast at every
+ * call site, and a cast is where a wrong key stops being visible.
+ *
+ * @param {string} cls
+ * @returns {string}
+ */
+export function categoryLabel(cls) {
+  return CATEGORY_LABEL[cls] ?? cls;
+}
+
 export function toResult(row) {
   const phrases = JSON.parse(row.phrases);
-  const category = CATEGORY_LABEL[row.cls] ?? row.cls;
+  const category = categoryLabel(row.cls);
 
   return {
 
@@ -255,17 +284,32 @@ export function searchGames(rows, args = {}) {
     // team had nothing" when it means "I did not recognise that". Fall through
     // to the ordinary recommendations instead.
     if (!matched.length) {
+      const fallbackGames = withLines(scored
+        .filter(s => RECOMMENDABLE.includes(s.row.cls))
+        .slice(0, RESULT_LIMIT)
+        .map(s => toResult(s.row))).map(toSearchResult);
+      // `unmatched` names the strings that matched no team. This is safe to
+      // report: it says nothing about any team's games, only that the text is
+      // not a team that played. Without it the model cannot tell a typo from a
+      // real result, so it pages forever through an identical list — observed
+      // live with "EM Tigers", which burned every step and produced no answer.
       return {
-        games: withLines(scored
-          .filter(s => RECOMMENDABLE.includes(s.row.cls))
-          .slice(0, RESULT_LIMIT)
-          .map(s => toResult(s.row))),
+        games: fallbackGames,
+        list: toListBlock(fallbackGames),
+        unmatched: [...wanted],
       };
     }
-    const offset = Math.min(args.offset ?? 0, Math.max(0, matched.length - 1));
+    // No clamp. Clamping an over-large offset to the last item served a game
+    // the user had already been shown — asking "any more?" after the list was
+    // exhausted returned the final game a second time. Past the end is empty,
+    // which is the honest answer and is not an absence signal: a team query
+    // only reaches a non-zero offset after games were already listed.
+    const offset = Math.max(0, args.offset ?? 0);
     const page = matched.slice(offset, offset + RESULT_LIMIT);
+    const pageGames = withLines(page.map(s => toResult(s.row))).map(toSearchResult);
     return {
-      games: withLines(page.map(s => toResult(s.row))),
+      games: pageGames,
+      list: toListBlock(pageGames),
       more: matched.length > offset + page.length,
     };
   }
@@ -275,7 +319,8 @@ export function searchGames(rows, args = {}) {
     .slice(0, RESULT_LIMIT)
     .map(s => toResult(s.row));
 
-  return { games: withLines(games) };
+  const out = withLines(games).map(toSearchResult);
+  return { games: out, list: toListBlock(out) };
 
 }
 
@@ -380,6 +425,42 @@ function withLines(games) {
     g.line = `${g.away} vs ${g.home} — ${g.category}.`;
   }
   return games;
+}
+
+/**
+ * The whole list as one markdown block, ready to emit.
+ *
+ * Handing the model five separate lines means it assembles them, and it
+ * assembles them into a paragraph — nine games ran together as a wall of text.
+ * Every previous assembly failure was fixed the same way: give it the finished
+ * artifact. This is the list-level version of that.
+ */
+function toListBlock(games) {
+  return games.map(g => `- ${g.line}`).join('\n');
+}
+
+/**
+ * What search_games actually returns per game.
+ *
+ * Phrases and qualities are NOT here. Three prompt attempts failed to stop the
+ * model using them on the first answer — it dropped the category and put a
+ * phrase in its place, and attached one game's phrase to another. Colour on
+ * turn one is the thing the site puts behind a button, so the model should not
+ * be holding it while it writes the list.
+ *
+ * Detail comes from get_game_detail, which is that button. The model has to
+ * ask for it, one game at a time, exactly as a reader clicks through.
+ */
+function toSearchResult(g) {
+  return {
+    id: g.id,
+    home: g.home,
+    away: g.away,
+    league: g.league,
+    date: g.date,
+    category: g.category,
+    line: g.line,
+  };
 }
 
 export function createCallCache() {

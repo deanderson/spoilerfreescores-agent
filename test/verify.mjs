@@ -444,46 +444,61 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
     console.log(`  categories surface as display labels (${[...seen].join(', ')})`);
   }
 
-  // 5c-quater. The first-turn line carries the matchup and category ONLY.
-  //     The site puts colour commentary behind a Why Watch button; chat has no
-  //     button, so the ask is the consent. A phrase on the first answer made
-  //     the agent more revealing than the site it is built on.
+  // 5c-quater. A search result carries the LINE and nothing that describes the
+  //     game. No phrases, no qualities, no overtime flag. Three prompt attempts
+  //     failed to stop the model using them on the first answer — it dropped
+  //     the category, put a phrase in its place, and attached one game's phrase
+  //     to another. Colour now lives behind get_game_detail, which is the
+  //     site's Why Watch button.
   {
-    for (const g of searchGames(corpus, {}).games) {
-      if (typeof g.line !== 'string' || !g.line.length) {
-        fail('oracle', `game ${g.id} has no preformatted line`);
-        continue;
-      }
-      if (!g.line.includes(g.category)) {
-        fail('oracle', `line omits the category: ${JSON.stringify(g.line)}`);
-      }
-      if (!g.line.startsWith(`${g.away} vs ${g.home}`)) {
-        fail('oracle', `line does not lead with the matchup: ${JSON.stringify(g.line)}`);
-      }
-      // No phrase may appear in the first-turn line.
-      for (const p of g.phrases) {
-        if (g.line.includes(p)) {
-          fail('oracle', `first-turn line reveals a phrase: ${JSON.stringify(g.line)}`);
+    const ALLOWED = ['id', 'home', 'away', 'league', 'date', 'category', 'line'];
+    const DESCRIBING = ['phrases', 'qualities', 'competitiveness', 'scoring',
+                        'overtime', 'ranked', 'cls', 'home_rank', 'away_rank'];
+
+    for (const probe of [{}, { prefer_teams: ['Tigers'] }, { competitiveness: 'nail_biter' }]) {
+      for (const g of searchGames(corpus, probe).games) {
+        for (const k of Object.keys(g)) {
+          if (!ALLOWED.includes(k)) {
+            fail('oracle', `search result carries "${k}" — detail belongs behind get_game_detail`);
+          }
+        }
+        for (const k of DESCRIBING) {
+          if (k in g) fail('oracle', `search result describes the game via "${k}"`);
+        }
+        if (typeof g.line !== 'string' || !g.line.includes(g.category)) {
+          fail('oracle', `line missing or omits the category: ${JSON.stringify(g.line)}`);
+        }
+        if (!g.line.startsWith(`${g.away} vs ${g.home}`)) {
+          fail('oracle', `line does not lead with the matchup: ${JSON.stringify(g.line)}`);
+        }
+        if (findViolation(g.line)) {
+          fail('oracle', `line contains a forbidden digit: ${JSON.stringify(g.line)}`);
         }
       }
-      if (findViolation(g.line)) {
-        fail('oracle', `line contains a forbidden digit: ${JSON.stringify(g.line)}`);
+    }
+
+    // The full view still carries phrases — get_game_detail reads from it.
+    const full = toResult(corpus.find(r => JSON.parse(r.phrases).length));
+    if (!full.phrases.length) fail('oracle', 'the detail view lost its phrases');
+
+    // The list block must contain every line, one per row, and nothing extra.
+    for (const probe of [{}, { prefer_teams: ['Tigers'] }]) {
+      const res = searchGames(corpus, probe);
+      const rows_ = res.list.split('\n');
+      if (rows_.length !== res.games.length) {
+        fail('oracle', `list has ${rows_.length} rows for ${res.games.length} games`);
+      }
+      res.games.forEach((g, i) => {
+        if (rows_[i] !== `- ${g.line}`) {
+          fail('oracle', `list row ${i} does not match the line: ${JSON.stringify(rows_[i])}`);
+        }
+      });
+      if (findViolation(res.list)) {
+        fail('oracle', `list block contains a forbidden digit`);
       }
     }
 
-    // Phrases must still travel, for the second rung.
-    const withPhrases = searchGames(corpus, {}).games.filter(g => g.phrases.length);
-    if (!withPhrases.length) {
-      fail('oracle', 'no game carries phrases — the second rung has nothing to say');
-    }
-
-    // A phraseless game still gets a usable line.
-    const recommendableRow = corpus.find(r => RECOMMENDABLE_CLS.includes(r.cls));
-    const bare = searchGames([{ ...recommendableRow, phrases: '[]' }], {}).games[0];
-    if (!bare.line || !bare.line.includes(bare.category)) {
-      fail('oracle', `phraseless game produced no usable line: ${JSON.stringify(bare.line)}`);
-    }
-    console.log('  first-turn lines carry matchup + category only, phrases held back');
+    console.log('  search results carry the line only; list block matches, colour behind get_game_detail');
   }
 
   // 5c-sexies. Two search paths, with different guarantees.
@@ -559,11 +574,33 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
     // and never a skip game the user did not ask for. "Owl" is a substring of
     // "Owls" but not a whole word in any team name, so it also separates
     // word matching from substring matching.
-    for (const q of ['Owl', 'Nonexistent Team FC', 'Texa']) {
+    for (const q of ['Owl', 'Nonexistent Team FC', 'Texa', 'EM Tigers']) {
       const res = searchGames(corpus, { prefer_teams: [q] });
       if (!res.games.length) fail('oracle', `"${q}" returned an empty list`);
       if (res.games.some(g => g.category === 'skip')) {
         fail('oracle', `unmatched query "${q}" surfaced a skip game`);
+      }
+      // The model must be able to tell a typo from a real result. Without this
+      // it pages forever through an identical list — observed live with
+      // "EM Tigers", which burned every step and produced no answer.
+      if (!Array.isArray(res.unmatched) || !res.unmatched.length) {
+        fail('oracle', `"${q}" matched nothing but did not report unmatched`);
+      }
+      if ('more' in res) {
+        fail('oracle', `"${q}" reported more on a fallback result — invites paging`);
+      }
+      // Fallback results are ordinary recommendations, and must be the SAME
+      // ones regardless of offset, or paging walks the corpus.
+      const paged = searchGames(corpus, { prefer_teams: [q], offset: 10 });
+      if (JSON.stringify(paged.games.map(g => g.id)) !== JSON.stringify(res.games.map(g => g.id))) {
+        fail('oracle', `"${q}" fallback changed with offset — paging a non-result`);
+      }
+    }
+
+    // A real team must NOT be reported as unmatched.
+    for (const q of ['Temple Owls', 'Texas', 'Tigers']) {
+      if ('unmatched' in searchGames(corpus, { prefer_teams: [q] })) {
+        fail('oracle', `"${q}" matched real games but was reported unmatched`);
       }
     }
 
@@ -597,6 +634,18 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
       }
       if (pages < 2) fail('oracle', 'pagination never advanced past the first page');
       if (more) fail('oracle', 'pagination never reported an end');
+
+      // Past the end is EMPTY, not the last game again. Clamping an over-large
+      // offset served a game the user had already seen: asking "any more?"
+      // after the list was exhausted returned the final game a second time.
+      for (const past of [offset, offset + 5, 500]) {
+        const res = searchGames(corpus, { prefer_teams: ['Texas'], offset: past });
+        if (res.games.length) {
+          fail('oracle', `offset ${past} is past the end but returned `
+            + `${res.games.length} game(s): ${JSON.stringify(res.games[0].line)}`);
+        }
+        if (res.more) fail('oracle', `offset ${past} past the end still reported more`);
+      }
 
       // The walk must reach every game that team played.
       const total = corpus.filter(r =>
@@ -643,7 +692,7 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
     for (const k of ['repeated', 'note', 'total', 'count', 'empty']) {
       if (k in again.value) fail('oracle', `repeat added an absence-capable key "${k}"`);
     }
-    if (Object.keys(again.value).join() !== 'games') {
+    if (Object.keys(again.value).sort().join() !== 'games,list') {
       fail('oracle', `repeat changed the result shape: ${Object.keys(again.value).join()}`);
     }
 
@@ -663,8 +712,10 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
   for (const f of FORBIDDEN) {
     if (top.includes(f)) fail('oracle', `result carries "${f}" — the model can report absence`);
   }
-  if (top.length !== 1 || top[0] !== 'games') {
-    fail('oracle', `result has keys ${JSON.stringify(top)}; expected only ["games"]`);
+  // `list` is the games already formatted — it carries nothing the games array
+  // does not, so it cannot express absence. Anything else must not appear.
+  if (top.sort().join() !== 'games,list') {
+    fail('oracle', `result has keys ${JSON.stringify(top)}; expected games + list`);
   }
 
   // 5e. Recency must anchor to the corpus, not the clock.

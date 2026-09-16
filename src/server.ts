@@ -6,7 +6,9 @@ import { convertToModelMessages, pruneMessages, stepCountIs, streamText, tool } 
 import { createScanTransform } from "./guard/scanner.js";
 import { dedupeAIStream, createFrameWatcher } from "./ai-stream-fix.js";
 import {
+  categoryLabel,
   createCallCache,
+  gameDetailInput,
   repairToolInput,
   searchGamesInput,
   watchOptionsInput,
@@ -139,7 +141,15 @@ supposed to contain none. Refer to games by the teams playing.
 If you have already called a tool with the same arguments, calling it again
 tells you nothing. Answer with what you have.
 
-HOW TO ANSWER FIRST. Each game comes with a "line" already written — the
+HOW TO ANSWER FIRST. The search result includes a "list": the games already
+formatted as a markdown list, one per line. Emit it exactly as given and
+nothing else. Do not rebuild it from the individual games, do not run the lines
+together into a paragraph, do not add a preamble or a closing sentence.
+
+If you paged through several searches, emit each "list" block in turn, each on
+its own lines.
+
+Each game also comes with a "line" already written — the
 matchup and how worth watching it was, nothing more. Emit those lines exactly
 as given, one per line, and nothing else: no preamble, no closing sentence, no
 date, no phrase, no quality, no reordering. You are not composing the list; you
@@ -182,6 +192,11 @@ always search again and see different games.
 If someone asks why a particular team is not in the list, the true answer is
 that you cannot tell: it may not be in the data at all, or it may simply have
 ranked below the games you were shown. Say that, rather than guessing which.
+
+If a search comes back with an unmatched list, you did not recognise the team
+name. Say so and ask which team they meant. Do not search again with an offset,
+and do not pass the games you got back off as that team's — they are ordinary
+recommendations, not that team's games.
 
 If someone asks for ALL of a team's games, or for everything, keep searching
 with a growing offset until the result says more: false, and list them all.
@@ -262,6 +277,44 @@ ${prefLines ? `What this user has told you they enjoy:\n${prefLines}` : ""}`,
               });
               throw err;
             }
+          },
+        }),
+
+        // The Why Watch button. search_games deliberately does not carry
+        // phrases or qualities — the model used them on the first answer every
+        // time it had them. Detail is one game at a time, on request.
+        get_game_detail: tool({
+          description: TOOL_DESCRIPTIONS.get_game_detail,
+          inputSchema: gameDetailInput,
+          execute: async ({ id }) => {
+            const prior = calls.lookup("get_game_detail", { id });
+            if (prior.hit) return prior.value;
+
+            const row = await this.env.DB.prepare(
+              `SELECT id, home, away, date, cls, competitiveness, scoring,
+                      overtime, ranked, home_rank, away_rank, phrases
+                 FROM games WHERE id = ? AND sport = ?`
+            ).bind(id, SPORT).first();
+
+            if (!row) {
+              return calls.remember("get_game_detail", { id }, { found: false });
+            }
+            const r = row as any;
+            return calls.remember("get_game_detail", { id }, {
+              home: r.home,
+              away: r.away,
+              date: r.date,
+              category: categoryLabel(r.cls),
+              home_rank: r.home_rank ?? undefined,
+              away_rank: r.away_rank ?? undefined,
+              qualities: {
+                competitiveness: r.competitiveness,
+                scoring: r.scoring,
+                overtime: !!r.overtime,
+                ranked: r.ranked,
+              },
+              phrases: JSON.parse(r.phrases),
+            });
           },
         }),
 

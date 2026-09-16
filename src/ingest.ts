@@ -81,7 +81,7 @@ export class IngestWorkflow extends WorkflowEntrypoint<Env> {
           `INSERT INTO games (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')}) ` +
           `ON CONFLICT(id) DO UPDATE SET ${cols.filter(c => c !== 'id').map(c => `${c}=excluded.${c}`).join(',')}`;
         const stmt = this.env.DB.prepare(sql);
-        await this.env.DB.batch(rows.map(r => stmt.bind(...cols.map(c => (r as any)[c]))));
+        await this.env.DB.batch(rows.map((r: any) => stmt.bind(...cols.map(c => (r as any)[c]))));
         return rows.length;
       },
     );
