@@ -22,6 +22,7 @@ import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
 import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput, repairToolInput, CATEGORY_LABEL, toResult, RECOMMENDABLE_CLS, createCallCache } from '../src/guard/tools.js';
 import { createScanner, findViolation, createScanTransform, FLOOR_LINE, BLOCKED_LINE } from '../src/guard/scanner.js';
 import { dedupeAIStream, rewriteFrame, createFrameWatcher } from '../src/ai-stream-fix.js';
+import { toIngestRow, buildStepResult, FORBIDDEN_ROW_FIELDS } from '../src/guard/ingest-row.js';
 
 const [htmlPath, fixturePath] = process.argv.slice(2);
 if (!htmlPath || !fixturePath) {
@@ -1195,6 +1196,88 @@ console.log('\n10. Tool input repair (§8.1 layer 2)');
   }
 
   console.log(`  ${repairs.length} type repairs applied, ${mustNotRepair.length} refused`);
+}
+
+// ── Test 11: Workflow step boundary (§3.1, §8.3) ─────────────────────────────
+// Workflows PERSISTS step return values, and `wrangler workflows instances
+// describe` prints them. A Tier 2 field here is durably stored outside the
+// Worker whether or not the model ever sees it.
+//
+// This is the gap that let every raw score persist for two days without any
+// test failing. The row builder lived inline in ingest.ts, where nothing could
+// reach it.
+
+console.log('\n11. Workflow step boundary (§3.1)');
+{
+  const rows = [];
+  let checked = 0;
+
+  for (const g of games) {
+    const view = buildSafeView(g, SPORT);
+    if (!view) continue;
+    const tags = deriveTags(g, SPORT);
+    if (!tags) continue;
+
+    const row = toIngestRow(view, tags, SPORT);
+    rows.push(row);
+    checked++;
+
+    for (const f of FORBIDDEN_ROW_FIELDS) {
+      if (f in row) fail('step', `row carries forbidden field "${f}" (game ${g.id})`);
+    }
+
+    // The actual scores must not appear anywhere a score could hide. Fields
+    // that legitimately carry numbers — the date, the timestamp, the game id,
+    // poll ranks — are excluded, or "Sep 12" collides with a 12-point score
+    // and the check becomes noise.
+    const json = JSON.stringify(row);
+    const scannable = { ...row };
+    for (const k of ['id', 'date', 'date_key', 'ts', 'ingested_at',
+                     'home_rank', 'away_rank', 'watch_url']) {
+      delete scannable[k];
+    }
+    const scanJson = JSON.stringify(scannable);
+    for (const [label, value] of [['home score', g.h], ['away score', g.a]]) {
+      if (typeof value !== 'number' || value < 10) continue;
+      if (new RegExp(`\\b${value}\\b`).test(scanJson)) {
+        fail('step', `${label} ${value} appears in the row for game ${g.id}: ${scanJson.slice(0, 160)}`);
+      }
+    }
+    // The margin is the other number worth checking: it is what the tags are
+    // derived from, and the most likely thing to be "helpfully" carried over.
+    if (typeof g.h === 'number' && typeof g.a === 'number') {
+      const margin = Math.abs(g.h - g.a);
+      if (margin >= 10 && new RegExp(`\\b${margin}\\b`).test(scanJson)) {
+        fail('step', `margin ${margin} appears in the row for game ${g.id}`);
+      }
+    }
+
+    // Factor labels carry point weights and raw descriptions.
+    for (const f of g.confidence?.factors ?? []) {
+      if (f.label && json.includes(f.label) && !JSON.parse(row.phrases).includes(f.label)) {
+        fail('step', `raw factor label "${f.label}" leaked into the row for ${g.id}`);
+      }
+    }
+  }
+
+  if (!checked) fail('step', 'no rows were built — the test exercised nothing');
+
+  // The step RESULT, not just a row: this is the object Workflows persists.
+  const result = buildStepResult(rows, games.length);
+  const resultJson = JSON.stringify(result);
+  if (Object.keys(result).sort().join() !== 'fetched,rows') {
+    fail('step', `step result has unexpected keys: ${Object.keys(result).join()}`);
+  }
+  for (const f of FORBIDDEN_ROW_FIELDS) {
+    if (new RegExp(`"${f}"\\s*:`).test(resultJson)) {
+      fail('step', `step result carries forbidden field "${f}"`);
+    }
+  }
+  if (typeof result.fetched !== 'number') {
+    fail('step', 'step result does not report how many games were fetched');
+  }
+
+  console.log(`  ${checked} rows built, step result carries only rows + count`);
 }
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll tests passed\n');

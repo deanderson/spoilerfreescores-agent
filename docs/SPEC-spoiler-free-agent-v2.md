@@ -288,10 +288,22 @@ about the tool — all prompt-shaped, all drift under pressure, none tested.
 
 Everything in §2.2 lives here.
 
-### 8.3 Known gap
+### 8.3 The step boundary
 
-Nothing asserts that a Workflow step return value is free of Tier 2 fields.
-That is the gap that let §3.1 be violated for two days without any test failing.
+Workflows **persists step return values**, and `wrangler workflows instances
+describe` prints them. A Tier 2 field in a step result is durably stored
+outside the Worker whether or not the model ever sees it.
+
+The row builder now lives in `guard/ingest-row.js` and test 11 asserts, for
+every game in the fixture: no forbidden field name, no score or margin value
+anywhere a score could hide, no raw factor label, and a step result carrying
+only rows and a count.
+
+> **This was the gap that let §3.1 be violated for two days without any test
+> failing.** The row builder lived inline in `ingest.ts`, where nothing could
+> reach it, and the Workflow persisted every raw score of every game. Same
+> lesson as `createCallCache`: anything that shapes what crosses a boundary
+> belongs where the harness can see it.
 
 ---
 
@@ -307,8 +319,8 @@ these games are final, so on-demand loses nothing.
 
 ## 10. Verification
 
-`npm run check` = `verify.mjs` + `tsc --noEmit`. Ten tests, each with a control
-run proving it fails when the thing it guards breaks.
+`npm run check` = `verify.mjs` + `tsc --noEmit`. Eleven tests, each with a
+control run proving it fails when the thing it guards breaks.
 
 1. Differential — ported layer vs live site
 2. Invariant — no digits in the emittable vocabulary
@@ -321,6 +333,8 @@ run proving it fails when the thing it guards breaks.
 8. Scan transform — stream wiring, stopStream, post-trip suppression
 9. Workers AI stream dedupe — text, tool calls, numeric carriers
 10. Tool input repair — type repairs applied, vocabulary repairs refused
+11. Workflow step boundary — no Tier 2 field, score, margin or raw label in a
+    persisted step result
 
 ### 10.1 Working agreement, revised
 

@@ -2,6 +2,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloud
 import { buildSafeView } from './guard/redaction.js';
 import { deriveTags } from './guard/tags.js';
 import { MIN_CORPUS } from './guard/tools.js';
+import { toIngestRow, buildStepResult } from './guard/ingest-row.js';
 
 const SPORT = 'ncaaf';
 const RETENTION_DAYS = 28;
@@ -57,35 +58,13 @@ export class IngestWorkflow extends WorkflowEntrypoint<Env> {
           const tags = deriveTags(g, SPORT);      // reads Tier 2, returns enums
           if (!tags) continue;
 
-          out.push({
-            id: view.id,
-            sport: SPORT,
-            home: view.home,
-            away: view.away,
-            league: view.league ?? null,
-            date: view.date ?? null,
-            date_key: view.dateKey,
-            ts: view.ts,
-            status: view.status ?? null,
-            home_rank: view.homeRank ?? null,
-            away_rank: view.awayRank ?? null,
-            broadcast: view.broadcast ?? null,
-            watch_name: view.watch?.name ?? null,
-            watch_url: view.watch?.url ?? null,
-            collinsworth_warning: view.collinsworthWarning ? 1 : 0,
-            cls: view.cls,
-            competitiveness: tags.competitiveness,
-            scoring: tags.scoring,
-            overtime: tags.overtime ? 1 : 0,
-            ranked: tags.ranked,
-            runtime_bucket: tags.runtime_bucket,
-            phrases: JSON.stringify(view.phrases),
-            ingested_at: Date.now(),
-          });
+          out.push(toIngestRow(view, tags, SPORT));
         }
 
         // Only counts and safe views cross this return. Nothing else.
-        return { rows: out, fetched: games.length };
+        // The shape is built in guard/ingest-row.js so a test can assert it —
+        // Workflows persists whatever is returned here.
+        return buildStepResult(out, games.length);
       },
     );
 
