@@ -33,12 +33,15 @@ CREATE TABLE games (
   collinsworth_warning  INTEGER,       -- 0/1
 
   -- Disclosed outcome shape. Named exception, §4.3.
-  cls                   TEXT NOT NULL CHECK (cls IN ('scorefest','watchworthy','watchable')),
+  -- Every class is stored. The site labels every game, including the ones it
+  -- tells you to skip, so a user asking about their own team gets an answer.
+  -- Non-recommendable games are filtered at SEARCH time, not at ingest.
+  cls                   TEXT NOT NULL CHECK (cls IN ('scorefest','watchworthy','watchable','defensive','blowout')),
 
   -- Closed-enum filter tags (§3.3). CHECK constraints are the point: an
   -- out-of-vocabulary value is rejected by the database, not by the code that
   -- wrote it.
-  competitiveness       TEXT NOT NULL CHECK (competitiveness IN ('nail_biter','close','competitive')),
+  competitiveness       TEXT NOT NULL CHECK (competitiveness IN ('nail_biter','close','competitive','lopsided')),
   scoring               TEXT NOT NULL CHECK (scoring IN ('shootout','balanced')),
   overtime              INTEGER NOT NULL CHECK (overtime IN (0,1)),
   ranked                TEXT NOT NULL CHECK (ranked IN ('both','one','neither')),

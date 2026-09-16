@@ -312,15 +312,52 @@ export const TIER1_FIELDS = [
   'homeRank', 'awayRank', 'broadcast', 'collinsworthWarning', 'watch',
 ];
 
+/**
+ * Classes the agent offers unprompted. Everything else is still INGESTED and
+ * still describable — the site labels every game, including ones it tells you
+ * to skip, so a user asking about their team gets an answer rather than
+ * silence. These are only the ones that surface in an unfiltered list.
+ */
 export const RECOMMENDABLE_CLS = ['scorefest', 'watchworthy', 'watchable'];
+
+/** Every class that may be stored. */
+export const ALL_CLS = [...RECOMMENDABLE_CLS, 'defensive', 'blowout'];
+
+/**
+ * The full safe view. Declared explicitly because the Tier 1 fields are copied
+ * in a loop, so TypeScript can only infer the two properties assigned by name
+ * and every caller sees a half-typed object.
+ *
+ * This is also the authoritative list of what may cross the boundary — if a
+ * field is not here, it does not reach the agent.
+ *
+ * @typedef {Object} SafeView
+ * @property {string}  id
+ * @property {string}  home
+ * @property {string}  away
+ * @property {string}  [league]
+ * @property {string}  [date]
+ * @property {string}  dateKey
+ * @property {number}  ts
+ * @property {string}  [status]
+ * @property {number}  [homeRank]
+ * @property {number}  [awayRank]
+ * @property {string}  [broadcast]
+ * @property {{name?: string, url?: string}} [watch]
+ * @property {boolean} [collinsworthWarning]
+ * @property {string}  cls
+ * @property {string[]} phrases
+ */
 
 /**
  * Build the safe view. Returns null for games that must not be recommended.
  * `factors` is read here and dropped here; it never appears in the return value.
+ *
+ * @returns {SafeView|null}
  */
 export function buildSafeView(game, sport) {
   const cls = game?.confidence?.cls;
-  if (!RECOMMENDABLE_CLS.includes(cls)) return null;
+  if (!cls) return null;
 
   const view = {};
   for (const k of TIER1_FIELDS) {

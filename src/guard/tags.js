@@ -12,7 +12,7 @@
  */
 
 export const TAG_VOCAB = {
-  competitiveness: ['nail_biter', 'close', 'competitive'],
+  competitiveness: ['nail_biter', 'close', 'competitive', 'lopsided'],
   scoring: ['shootout', 'balanced'],
   ranked: ['both', 'one', 'neither'],
   runtime_bucket: ['under_2h', '2_to_3h', 'over_3h'],
@@ -51,12 +51,14 @@ export function deriveTags(game, sport) {
   // both gave two different definitions of "recommendable" that disagreed on
   // 8 of 45 fixture games. See the competitiveness ceiling below.
 
+  // The corpus now holds every game, not just recommendable ones, so
+  // "competitive" can no longer absorb everything above 7 — a 40-point blowout
+  // would be labelled competitive. Anything beyond 14 is lopsided.
   let competitiveness;
   if (diff <= 3) competitiveness = 'nail_biter';
   else if (diff <= 7) competitiveness = 'close';
-  else competitiveness = 'competitive';  // ceiling raised 14 -> open; cls
-                                          // already excluded blowouts, and a
-                                          // coarser bucket leaks fewer bits
+  else if (diff <= 14) competitiveness = 'competitive';
+  else competitiveness = 'lopsided';
 
   const scoring = total >= 65 ? 'shootout' : 'balanced';
   const overtime = (game.period ?? 4) > 4;

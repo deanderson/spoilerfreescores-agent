@@ -49,7 +49,10 @@ export class IngestWorkflow extends WorkflowEntrypoint<Env> {
         const out = [];
 
         for (const g of games) {
-          const view = buildSafeView(g, SPORT);   // cls gate + approved phrases
+          // Every game is stored now, not just recommendable ones — the
+          // search layer decides what surfaces. A user asking about their own
+          // team should get an answer, and the site labels every game anyway.
+          const view = buildSafeView(g, SPORT);   // approved phrases only
           if (!view) continue;
           const tags = deriveTags(g, SPORT);      // reads Tier 2, returns enums
           if (!tags) continue;
