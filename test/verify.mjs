@@ -19,8 +19,8 @@ import {
   getInsightPhrases, buildSafeView, TIER1_FIELDS,
 } from '../src/guard/redaction.js';
 import { deriveTags, TAG_VOCAB } from '../src/guard/tags.js';
-import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput, repairToolInput, CATEGORY_LABEL, toResult, RECOMMENDABLE_CLS } from '../src/guard/tools.js';
-import { createScanner, findViolation, createScanTransform, FLOOR_LINE } from '../src/guard/scanner.js';
+import { searchGames, MIN_CORPUS, searchGamesInput, savePreferenceInput, repairToolInput, CATEGORY_LABEL, toResult, RECOMMENDABLE_CLS, createCallCache } from '../src/guard/tools.js';
+import { createScanner, findViolation, createScanTransform, FLOOR_LINE, BLOCKED_LINE } from '../src/guard/scanner.js';
 import { dedupeAIStream, rewriteFrame, createFrameWatcher } from '../src/ai-stream-fix.js';
 
 const [htmlPath, fixturePath] = process.argv.slice(2);
@@ -303,26 +303,43 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
   //     excluded at ingest — must produce an identically sized result.
   //     Those excluded teams are the whole point: they are the ones a hard
   //     filter would betray.
-  const inCorpus = new Set(corpus.flatMap(r => [r.home, r.away]));
+  // Teams whose games are ALL non-recommendable. These are the ones a hard
+  // filter would betray: before the corpus held every game they were absent
+  // entirely, and now they are present but never surface unprompted.
+  const recommendableTeams = new Set(
+    corpus.filter(r => RECOMMENDABLE_CLS.includes(r.cls)).flatMap(r => [r.home, r.away]));
   const allTeams = [...new Set(games.flatMap(g => [g.home, g.away]).filter(Boolean))];
-  const excluded = allTeams.filter(t => !inCorpus.has(t));
+  const excluded = allTeams.filter(t => !recommendableTeams.has(t));
 
-  const sizes = new Map();
+  // A named team returns THEIR games — the count varies with how many they
+  // played, which reveals nothing about how any of them went. What must hold:
+  // every team gets an answer (silence is what would betray a team whose games
+  // were all blowouts) and nothing unrelated comes back.
+  let silent = 0;
+  let unrelated = 0;
   for (const team of allTeams) {
-    const n = searchGames(corpus, { prefer_teams: [team] }).games.length;
-    if (!sizes.has(n)) sizes.set(n, []);
-    sizes.get(n).push(team);
-  }
-  if (sizes.size === 1 && sizes.has(EXPECT)) {
-    console.log(`  ${allTeams.length} teams probed (${excluded.length} with zero `
-      + `recommendable games) — all return ${EXPECT}`);
-  } else {
-    for (const [n, teams] of sizes) {
-      if (n !== EXPECT) {
-        fail('oracle', `${teams.length} team(s) return ${n} results, not ${EXPECT} `
-          + `— e.g. ${JSON.stringify(teams.slice(0, 3))}. prefer_teams is excluding.`);
+    const got = searchGames(corpus, { prefer_teams: [team] }).games;
+    if (!got.length) {
+      silent++;
+      if (silent <= 3) fail('oracle', `"${team}" returned nothing — silence betrays the team`);
+      continue;
+    }
+    for (const g of got) {
+      if (g.home !== team && g.away !== team) {
+        unrelated++;
+        if (unrelated <= 3) {
+          fail('oracle', `"${team}" returned an unrelated game: ${JSON.stringify(g.line)}`);
+        }
       }
     }
+  }
+  if (!silent && !unrelated) {
+    console.log(`  ${allTeams.length} teams probed (${excluded.length} with zero `
+      + `recommendable games) — every team answered, nothing unrelated`);
+  }
+  if (excluded.length < 50) {
+    fail('oracle', `only ${excluded.length} teams lack a recommendable game — `
+      + `the probe has lost the case it exists to test`);
   }
 
   // 5c. Same property across every enum value, including combinations that
@@ -345,8 +362,9 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
             if (rc) p.recency = rc;
             probes.push(p);
           }
-  // Plus the same grid narrowed to teams with nothing recommendable.
-  for (const p of probes.slice(0, 24)) probes.push({ ...p, prefer_teams: excluded.slice(0, 2) });
+  // Team queries are deliberately NOT in this grid: naming a team switches to
+  // the other search path, where size varies with how many games they played.
+  // Size invariance is a property of the generic path.
 
   let varied = 0;
   const seenSizes = new Map();
@@ -425,9 +443,10 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
     console.log(`  categories surface as display labels (${[...seen].join(', ')})`);
   }
 
-  // 5c-quater. The first-turn line is composed in code, not by the model.
-  //     Three prompt attempts produced three different shapes, so the guard
-  //     now hands over a finished string.
+  // 5c-quater. The first-turn line carries the matchup and category ONLY.
+  //     The site puts colour commentary behind a Why Watch button; chat has no
+  //     button, so the ask is the consent. A phrase on the first answer made
+  //     the agent more revealing than the site it is built on.
   {
     for (const g of searchGames(corpus, {}).games) {
       if (typeof g.line !== 'string' || !g.line.length) {
@@ -440,59 +459,205 @@ console.log('\n5. Oracle resistance (team boost, §6.1)');
       if (!g.line.startsWith(`${g.away} vs ${g.home}`)) {
         fail('oracle', `line does not lead with the matchup: ${JSON.stringify(g.line)}`);
       }
-      // The line must use one of the game's OWN phrases — not necessarily the
-      // top-weighted one. Choosing across the whole result set avoids five
-      // lines that all read "Down to the wire", but it must never invent or
-      // borrow a phrase from another game.
-      if (g.phrases.length && !g.phrases.some(p => g.line.includes(p))) {
-        fail('oracle', `line uses no phrase belonging to this game: ${JSON.stringify(g.line)}`);
+      // No phrase may appear in the first-turn line.
+      for (const p of g.phrases) {
+        if (g.line.includes(p)) {
+          fail('oracle', `first-turn line reveals a phrase: ${JSON.stringify(g.line)}`);
+        }
       }
-      // The line is shown to a user: it must obey invariant 1 like any other
-      // emitted text.
       if (findViolation(g.line)) {
         fail('oracle', `line contains a forbidden digit: ${JSON.stringify(g.line)}`);
       }
     }
-    // A game with no phrases still needs a usable line.
-    const bare = searchGames([{ ...corpus[0], phrases: '[]' }], {}).games[0];
+
+    // Phrases must still travel, for the second rung.
+    const withPhrases = searchGames(corpus, {}).games.filter(g => g.phrases.length);
+    if (!withPhrases.length) {
+      fail('oracle', 'no game carries phrases — the second rung has nothing to say');
+    }
+
+    // A phraseless game still gets a usable line.
+    const recommendableRow = corpus.find(r => RECOMMENDABLE_CLS.includes(r.cls));
+    const bare = searchGames([{ ...recommendableRow, phrases: '[]' }], {}).games[0];
     if (!bare.line || !bare.line.includes(bare.category)) {
       fail('oracle', `phraseless game produced no usable line: ${JSON.stringify(bare.line)}`);
     }
+    console.log('  first-turn lines carry matchup + category only, phrases held back');
+  }
 
-    // Phrase repetition across the list should be minimised — that is the
-    // whole reason choice happens at set level.
-    const lines = searchGames(corpus, {}).games.map(g => g.line);
-    const tails = lines.map(l => l.split('—')[1] ?? '');
-    const dupes = tails.length - new Set(tails).size;
-    if (dupes > 2) {
-      fail('oracle', `${dupes} duplicate phrase(s) across ${tails.length} lines — set-level choice is not working`);
+  // 5c-sexies. Two search paths, with different guarantees.
+  //
+  //   NAMED TEAM — shows that team's games, best first, skip games included.
+  //     Size varies with how many games they played, which says nothing about
+  //     how any went. Ambiguous queries ("Tigers") just show more teams.
+  //   NO TEAM — the §6.2 path: recommendable only, fixed size, no field
+  //     capable of expressing absence. This is the one that must stay
+  //     uninformative.
+  {
+    // Generic path: no skip games, ever.
+    for (const p of [{}, { competitiveness: 'nail_biter' }, { overtime: true },
+                     { recency: 'this_week' }, { competitiveness: 'lopsided' },
+                     { competitiveness: 'lopsided', scoring: 'shootout' }]) {
+      const res = searchGames(corpus, p);
+      for (const g of res.games) {
+        if (g.category === 'skip') {
+          fail('oracle', `skip game surfaced for ${JSON.stringify(p)}: ${JSON.stringify(g.line)}`);
+        }
+      }
+      if ('more' in res) fail('oracle', `generic result carries "more": ${JSON.stringify(p)}`);
+      if (res.games.length !== EXPECT) {
+        fail('oracle', `generic result size varied: ${res.games.length} for ${JSON.stringify(p)}`);
+      }
     }
-    // A game with nothing unique left must fall back to its OWN top phrase,
-    // never to a phrase another game used. Synthetic, because in the fixture
-    // the borrowed phrase happens to belong to the game anyway — so the
-    // fixture cannot distinguish the two behaviours.
-    {
-      const mk = (id, phrases) => ({
-        ...corpus[0], id, home: `H${id}`, away: `A${id}`,
-        ts: Date.now() - id * 1000, phrases: JSON.stringify(phrases),
-      });
-      const synth = [mk(1, ['Alpha']), mk(2, ['Beta']), mk(3, ['Beta'])];
-      for (const g of searchGames(synth, {}).games) {
-        const own = JSON.parse(synth.find(r => r.id === g.id).phrases);
-        if (!own.some(p => g.line.includes(p))) {
-          fail('oracle', `line borrowed a phrase this game does not have: ${JSON.stringify(g.line)}`);
+
+    // Named path: the team's own games come back, skip included and labelled.
+    const skipOnly = corpus.filter(r => !RECOMMENDABLE_CLS.includes(r.cls));
+    if (!skipOnly.length) fail('oracle', 'corpus holds no skip-class games to test');
+    const target = skipOnly[0];
+    const named = searchGames(corpus, { prefer_teams: [target.home] });
+    if (!named.games.some(g => g.id === target.id)) {
+      fail('oracle', `naming "${target.home}" did not surface their own game`);
+    }
+    const surfaced = named.games.find(g => g.id === target.id);
+    if (surfaced && surfaced.category !== 'skip') {
+      fail('oracle', `skip game surfaced as "${surfaced.category}"`);
+    }
+
+    // Best first. Checking the returned order alone is not enough: inverting
+    // the sort returned five skip games, which is trivially non-increasing.
+    // The top result must be the best category available among ALL matches.
+    const rank = { 'scorefest': 4, 'must watch': 3, 'watchable': 2, 'skip': 1 };
+    const clsRank = { scorefest: 4, watchworthy: 3, watchable: 2, defensive: 1, blowout: 1 };
+    for (const q of ['Tigers', 'Texas', 'Bulldogs', target.home]) {
+      const ql = q.toLowerCase();
+      const hits = corpus.filter(r => [r.home, r.away].some(n => {
+        const w = n.toLowerCase().split(/\s+/);
+        const qq = ql.split(/\s+/);
+        for (let i = 0; i + qq.length <= w.length; i++) {
+          if (qq.every((x, j) => w[i + j] === x)) return true;
+        }
+        return false;
+      }));
+      if (!hits.length) continue;
+      const bestAvailable = Math.max(...hits.map(r => clsRank[r.cls] ?? 0));
+
+      const got = searchGames(corpus, { prefer_teams: [q] }).games;
+      if (rank[got[0].category] !== bestAvailable) {
+        fail('oracle', `"${q}" led with ${JSON.stringify(got[0].line)} but a better `
+          + `category was available among its games`);
+      }
+      for (let i = 1; i < got.length; i++) {
+        if (rank[got[i].category] > rank[got[i - 1].category]) {
+          fail('oracle', `"${q}" returned a better game below a worse one: `
+            + `${JSON.stringify(got[i - 1].line)} then ${JSON.stringify(got[i].line)}`);
         }
       }
     }
 
-    console.log(`  first-turn lines composed in code, ${dupes} repeated phrase(s) across ${lines.length}`);
+    // A name matching nothing falls back to the ordinary list — never empty,
+    // and never a skip game the user did not ask for. "Owl" is a substring of
+    // "Owls" but not a whole word in any team name, so it also separates
+    // word matching from substring matching.
+    for (const q of ['Owl', 'Nonexistent Team FC', 'Texa']) {
+      const res = searchGames(corpus, { prefer_teams: [q] });
+      if (!res.games.length) fail('oracle', `"${q}" returned an empty list`);
+      if (res.games.some(g => g.category === 'skip')) {
+        fail('oracle', `unmatched query "${q}" surfaced a skip game`);
+      }
+    }
+
+    // `more` must be honest: set when the cap truncated, clear when it did not.
+    const wide = searchGames(corpus, { prefer_teams: ['Tigers'] });
+    if (!wide.more) fail('oracle', '"Tigers" matched many teams but did not report more');
+    const narrow = searchGames(corpus, { prefer_teams: [target.home] });
+    if (narrow.games.length < 5 && narrow.more) {
+      fail('oracle', `"${target.home}" returned ${narrow.games.length} games but reported more`);
+    }
+
+    // Pagination. Without it, "any others?" returns the same five and the
+    // model announces them as new — observed live.
+    {
+      const seen = new Set();
+      let offset = 0;
+      let pages = 0;
+      let more = true;
+      while (more && pages < 10) {
+        const res = searchGames(corpus, { prefer_teams: ['Texas'], offset });
+        if (!res.games.length) { fail('oracle', `offset ${offset} returned nothing`); break; }
+        for (const g of res.games) {
+          if (seen.has(g.id)) {
+            fail('oracle', `offset ${offset} repeated a game already shown: ${JSON.stringify(g.line)}`);
+          }
+          seen.add(g.id);
+        }
+        more = res.more;
+        offset += res.games.length;
+        pages++;
+      }
+      if (pages < 2) fail('oracle', 'pagination never advanced past the first page');
+      if (more) fail('oracle', 'pagination never reported an end');
+
+      // The walk must reach every game that team played.
+      const total = corpus.filter(r =>
+        [r.home, r.away].some(n => /\bTexas\b/i.test(n))).length;
+      if (seen.size !== total) {
+        fail('oracle', `pagination saw ${seen.size} of ${total} matching games`);
+      }
+
+      // The generic path ignores offset entirely. Checking size is not enough:
+      // slicing at an offset still yields five games. The result must be
+      // IDENTICAL, or offset becomes a way to walk the corpus on the path that
+      // is supposed to be uninformative.
+      const base = JSON.stringify(searchGames(corpus, {}).games.map(g => g.id));
+      for (const off of [1, 5, 20]) {
+        const got = JSON.stringify(searchGames(corpus, { offset: off }).games.map(g => g.id));
+        if (got !== base) {
+          fail('oracle', `offset ${off} changed the generic result — the fixed-size `
+            + `path must ignore it`);
+        }
+      }
+    }
+
+    console.log('  named team shows all its games best-first, paginated; generic path unchanged');
+  }
+
+  // 5c-quinquies. A repeated identical tool call must replay the earlier
+  //     result, NOT an empty one. The first implementation returned
+  //     { games: [], repeated: true } — an empty array and two new keys in the
+  //     one shape that must never express absence. Live probing caught it; the
+  //     tests did not, because the guard lived outside the tested boundary.
+  {
+    const cache = createCallCache();
+    const args = { competitiveness: 'nail_biter' };
+    const first = cache.remember('search_games', args, searchGames(corpus, args));
+
+    const again = cache.lookup('search_games', args);
+    if (!again.hit) fail('oracle', 'repeated call was not recognised');
+    if (JSON.stringify(again.value) !== JSON.stringify(first)) {
+      fail('oracle', 'repeated call did not replay the identical result');
+    }
+    if (again.value.games.length !== first.games.length) {
+      fail('oracle', `repeat changed result size: ${first.games.length} -> ${again.value.games.length}`);
+    }
+    for (const k of ['repeated', 'note', 'total', 'count', 'empty']) {
+      if (k in again.value) fail('oracle', `repeat added an absence-capable key "${k}"`);
+    }
+    if (Object.keys(again.value).join() !== 'games') {
+      fail('oracle', `repeat changed the result shape: ${Object.keys(again.value).join()}`);
+    }
+
+    // Different arguments are a different call.
+    if (cache.lookup('search_games', { competitiveness: 'close' }).hit) {
+      fail('oracle', 'cache collided across different arguments');
+    }
+    console.log('  repeated tool calls replay the identical result, shape unchanged');
   }
 
   // 5d. The return shape must have no field capable of expressing absence.
   //     Checked structurally rather than by inspection, so a field added later
   //     to be helpful trips this.
   const FORBIDDEN = ['total', 'count', 'matched', 'relaxed', 'message', 'empty', 'note'];
-  const sample = searchGames(corpus, { prefer_teams: excluded.slice(0, 1) });
+  const sample = searchGames(corpus, {});
   const top = Object.keys(sample);
   for (const f of FORBIDDEN) {
     if (top.includes(f)) fail('oracle', `result carries "${f}" — the model can report absence`);
@@ -604,6 +769,12 @@ console.log('\n7. Output scanner (§8.1 layer 3)');
     'It went to 2 overtimes.',
     'Rushing total was 212 yards.',
     'Score: 21-20',
+    // Off-topic digits trip too. Correct — the scanner cannot tell football
+    // numbers from any other kind, which is why the agent declines off-topic
+    // requests rather than answering them badly.
+    'Here are 10 Roman emperors:',
+    'Nero ruled from 54 AD.',
+    'The first 3 prime numbers are 2, 3, 5.',
     // A list marker must not launder a digit elsewhere on the line.
     '1. McNeese won 38-14',
     'Here are picks:\n1. Texas by 3',
@@ -693,6 +864,36 @@ console.log('\n7. Output scanner (§8.1 layer 3)');
   }
   console.log(`  ${splits.length} split-delta streams handled, no digits emitted before a trip`);
 
+  // A trip must not strand a partial sentence on screen. Emitting token by
+  // token left fragments like "Ner" or "Here are" when the scanner fired,
+  // which reads as a crash rather than a refusal.
+  {
+    const cases = [
+      'Here are 10 Roman emperors: Augustus, Nero.',
+      'Nero ruled the empire. He came to power in 54 AD.',
+      'It was close. They won by 3.',
+    ];
+    for (const text of cases) {
+      const s = createScanner();
+      let out = '';
+      let violation = null;
+      for (const ch of text) {
+        const r = s.push(ch);
+        out += r.emit;
+        if (r.violation) { violation = r.violation; break; }
+      }
+      if (!violation) { const f = s.flush(); out += f.emit; violation = f.violation; }
+
+      if (!violation) { fail('scanner', `expected a trip: ${JSON.stringify(text)}`); continue; }
+      // Whatever was released must end at a sentence boundary — never mid-word.
+      const trimmed = out.replace(/\s+$/, '');
+      if (trimmed && !/[.!?]$/.test(trimmed)) {
+        fail('scanner', `trip stranded a partial sentence: ${JSON.stringify(out)}`);
+      }
+    }
+    console.log('  a trip strands no partial sentence');
+  }
+
   // A clean stream must emit its full text, tail included.
   const clean = 'A back-and-forth game between #8 Texas and Oklahoma on Sep 12.';
   const s2 = createScanner();
@@ -759,14 +960,20 @@ console.log('\n8. Scan transform (stream wiring)');
     const r = await run(deltas('t2', [long, 'score was ', '3', '8', '-14.']));
     if (!r.violations.length) fail('transform', 'violation not reported');
     if (/\d/.test(r.text)) fail('transform', `emitted digits: ${JSON.stringify(r.text)}`);
-    if (!r.text.includes(FLOOR_LINE)) fail('transform', 'floor line not emitted');
+    if (!r.text.includes(BLOCKED_LINE)) fail('transform', 'blocked line not emitted');
+    // A scanner trip is a safety stop, not the disclosure floor. Using the
+    // floor line implies a spoiler is being withheld — wrong, and confusing
+    // when the blocked digit had nothing to do with football.
+    if (r.text.includes(FLOOR_LINE)) {
+      fail('transform', 'a scanner trip used the disclosure floor line');
+    }
     // The cut sentence and the floor line must not run together.
-    if (!r.text.includes(`\n\n${FLOOR_LINE}`)) {
+    if (!r.text.includes(`\n\n${BLOCKED_LINE}`)) {
       fail('transform', `floor line not separated from the truncated sentence: ${JSON.stringify(r.text.slice(-70))}`);
     }
     if (!r.stopped) fail('transform', 'stopStream not called on violation');
     if (r.violations.length && !/\d/.test(r.text) && r.stopped) {
-      console.log(`  violation: stopped, no digits emitted, floor line sent`);
+      console.log(`  violation: stopped, no digits emitted, blocked line sent`);
     }
   }
 
@@ -782,8 +989,8 @@ console.log('\n8. Scan transform (stream wiring)');
       ...deltas('t3b', ['It also stayed close down the stretch.']),
     ]);
     if (/\d/.test(r.text)) fail('transform', `leaked after trip: ${JSON.stringify(r.text)}`);
-    const after = r.text.slice(r.text.indexOf(FLOOR_LINE) + FLOOR_LINE.length);
-    if (!r.text.includes(FLOOR_LINE)) fail('transform', 'floor line missing on trip');
+    const after = r.text.slice(r.text.indexOf(BLOCKED_LINE) + BLOCKED_LINE.length);
+    if (!r.text.includes(BLOCKED_LINE)) fail('transform', 'blocked line missing on trip');
     else if (after.trim()) fail('transform', `emitted text after the floor line: ${JSON.stringify(after)}`);
     else console.log('  post-trip parts suppressed');
   }
@@ -949,6 +1156,10 @@ console.log('\n10. Tool input repair (§8.1 layer 2)');
     ['mixed valid + typo',    '{"competitiveness": "nail_biter", "overtime": "true"}',
                               { competitiveness: 'nail_biter', overtime: true }],
     ['drops unknown key',     '{"margin_under": 5, "overtime": "true"}',       { overtime: true }],
+    // Observed live: the model sent offset: "5" and the call was rejected,
+    // exactly as it had sent overtime: "true".
+    ['numeric string offset',  '{"offset": "5"}',                              { offset: 5 }],
+    ['zero offset',            '{"offset": "0"}',                              { offset: 0 }],
   ];
   for (const [name, input, want] of repairs) {
     const got = repairToolInput(searchGamesInput, input);
@@ -963,6 +1174,9 @@ console.log('\n10. Tool input repair (§8.1 layer 2)');
     ['numeric threshold',     '{"margin_under": 5}'],
     ['truthy guess',          '{"overtime": "yes"}'],
     ['truthy number',         '{"overtime": 1}'],
+    // A fractional or spelled-out offset is not the same value re-encoded.
+    ['fractional offset',     '{"offset": "5.5"}'],
+    ['spelled offset',        '{"offset": "five"}'],
     ['raw score field',       '{"h": 38, "a": 14}'],
     ['not json',              'not json'],
     ['array input',           '[1,2,3]'],
