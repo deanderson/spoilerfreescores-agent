@@ -41,7 +41,8 @@
 	  {
 	    "name": "sfs-ingest",
 	    "binding": "INGEST",
-	    "class_name": "IngestWorkflow"
+	    "class_name": "IngestWorkflow",
+        "schedules": ["0 */6 * * *"]
 	  }
 	],
 	"migrations": [
