@@ -56,6 +56,6 @@ The UI for the deployment is ugly but the bones are alive and good and I can ite
 
 # How I worked
 
-All code is available in GitHub as well as prompt history. Design was done in one chat session, a new session was created for implementation and decision making, and a third chat existed for infrastructure operations and some prompt creation that was excluded for brevity. All commit messages were intentionally written as a narrative to tell the story of the project.
+All code is available in GitHub as well as prompt history. Design was done in one chat session, a new session was created for implementation and decision making, and a third chat existed for infrastructure operations and some prompt creation that was excluded for brevity. I set up the build session so the graded history would be clean, and was told the design conversation had value anyway, so both are included. All commit messages were intentionally written as a narrative to tell the story of the project.
 
 The design transcript has a lot of me saying ok. The places I steered are easier to find in the build transcript: a check that we were still building on the Cloudflare Agents SDK (31), the product call to show a team's games when asked, including the ones to skip (259, 261, 267), and the off topic probes I found by typing what a real user types (277). Progressive disclosure was my idea and Claude corrected it into a fixed budget (design 19).
